@@ -1,7 +1,7 @@
 name: Sync data
 
 # 本仓库是公开的，只放这一个 workflow；同步脚本与数据全在私有仓库（vars.CONTENT_REPO）。
-# 运行时用 CONTENT_REPO_TOKEN checkout 私有仓库 main → 跑 scripts/sync-*.js → 与 main 比出差异 →
+# 运行时用 CONTENT_REPO_TOKEN checkout 私有仓库 main → 跑 scripts/sync-*.js（Forever 与经典 60 两个版本）→ 与 main 比出差异 →
 # 推 bot/data-sync 分支并开（或更新）PR → 等私有仓库的 ci.yml 在 PR 上跑完 → 合并 → 升补丁版本、推 release-v* tag。
 # tag 由 PAT 推送，会正常触发私有仓库的 deploy.yml（先跑一遍 CI，再构建镜像部署）。
 #
@@ -11,6 +11,23 @@ name: Sync data
 #   - artifact 用 ARTIFACT_PASSPHRASE 加密后才上传，没配口令就不上传；
 #   - 文件名、PR 号之类不写进 $GITHUB_ENV（那里的变量会在后续每个步骤开头打印到日志）；
 #   - 只允许 schedule / workflow_dispatch 触发，不接任何 PR 事件（fork 拿不到 secrets，也碰不到这里）。
+#
+# 两个版本：Forever（data/forever、src/data/forever）先跑；经典 60（--edition classic → data/classic、src/data/classic）
+# 排在后面、每一项都软失败，经典出问题不影响 Forever 照常更新。两个版本共用的：public/icons、public/assets/dungeons、
+# data/dungeons（首领坐标，等两个版本的副本掉落都跑完再对位）、data/quests。
+#
+# 不是每一项每次都全量拉（手动运行勾选「全量」时例外，一律照跑）：
+#   · 任务、首领坐标：脚本先算上游指纹，与产物 meta.input 相同就跳过。
+#   · Forever 的装备 / 物品 / 天赋 / 传承（Wowhead 数据页）：先看数据页上的客户端 build（scripts/check-wowhead-build.js），
+#     变了立刻跑；没变时每天（UTC 日期）至少全量跑一次 —— Wowhead 改数据不一定升 build，不能只看它。
+#   · Forever 的副本掉落（几百个页面，耗时大头）：每天跑一次。
+#   · 经典 60 已经稳定，只按版本号同步：Wowhead 经典数据版本与 wago 经典客户端 build（wow_classic_era）
+#     任意一个变了，五项（装备 / 物品 / 天赋 / 专业 / 副本掉落）一起跑；都没变就全部跳过 —— 有依据地跑，不按日期猜。
+#     两个号记在私有仓库的 data/classic/upstream.json（scripts/check-wowhead-build.js --with-wago / --stamp），
+#     五项全部成功才更新记录，随 PR 合并进 main；没合并时 main 上还是旧号，下一轮照样重试。
+#   「今天跑过了」记在本仓库的 actions 缓存里（.cache/sync-marks/<项>，按日期换 key）。一项跑完没产生改动、或改动已经
+#   合并，才记为跑过；改动还在没合并的 PR 里时不记，下次照跑，免得 PR 被后面的同步覆盖掉这部分改动。
+#   专业、职业改动没有可靠的变化信号，仍然每次都跑。
 #
 # 解密 artifact：
 #   openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:PASS -in run-N.tar.gz.enc | tar xzf -
@@ -33,6 +50,10 @@ on:
         description: 数据有更新且 CI 通过时，自动合并、发版并部署
         type: boolean
         default: true
+      full:
+        description: 全量：忽略「今天已跑过」与上游指纹，每一项都照跑
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -45,14 +66,16 @@ env:
   CONTENT_REPO: ${{ vars.CONTENT_REPO }}
   HOTFIX_ONLY: ${{ github.event.schedule == '40 */2 * * *' || (github.event_name == 'workflow_dispatch' && inputs.hotfix_only) }}
   RELEASE: ${{ github.event_name == 'schedule' || inputs.release }}
+  FULL: ${{ github.event_name == 'workflow_dispatch' && inputs.full }}
   SYNC_BRANCH: bot/data-sync
 
 jobs:
   sync:
     if: github.event.schedule != '17 3 1 * *'
     runs-on: ubuntu-latest
-    # 全量同步平时 40 分钟上下（大头是副本掉落那三百来个 Wowhead 页面）；后面还要等私有仓库的 CI。
-    timeout-minutes: 110
+    # Forever 全量平时 40 分钟上下（大头是副本掉落那三百来个 Wowhead 页面），经典 60 跟在后面再跑一轮；
+    # 平时大多数项按 build / 每天一次跳过。后面还要等私有仓库的 CI。
+    timeout-minutes: 150
     outputs:
       merged: ${{ steps.merge.outputs.merged }}
     steps:
@@ -90,10 +113,13 @@ jobs:
       # 副本掉落里经典旧世的页面（三百多个地区页 / 首领页）早已定型，按周缓存：一周里只有第一次全量同步真去拉。
       # 不设 restore-keys：换周就是新 key、从空目录开始。只跑热修时不碰这份缓存。
       # 公开仓库的 Actions cache 只有本仓库的 workflow 读得到，外人下载不了。
-      - name: Week key for classic page cache
+      # 经典 60 的副本掉落用的就是这批经典旧世页面（同名同址），一并读写这份缓存。
+      - name: Week and day keys
         id: week
         if: env.HOTFIX_ONLY != 'true'
-        run: echo "key=zone-loot-classic-$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "key=zone-loot-classic-$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
 
       - name: Restore classic page cache
         id: classic_cache
@@ -102,6 +128,15 @@ jobs:
         with:
           path: .cache/zone-loot-classic
           key: ${{ steps.week.outputs.key }}
+
+      # 「今天已跑过」的标记：每次运行都另存一份新 key（带 run_id），restore-keys 取当天最近的那份。
+      - name: Restore sync marks
+        if: env.HOTFIX_ONLY != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/sync-marks
+          key: sync-marks-${{ steps.week.outputs.day }}-${{ github.run_id }}
+          restore-keys: sync-marks-${{ steps.week.outputs.day }}-
 
       - name: Pull upstream data
         id: pull
@@ -119,33 +154,106 @@ jobs:
             else
               echo "::warning::$name 失败，本次跳过（详情在加密 artifact 里）"
               printf '### %s\n\n- ⚠ %s\n\n' "$name" "$note" >> "$REPORT"
+              return 1
             fi
           }
           step "服务端热修" "同步失败（Raidbots 缓存不可用），本次跳过，沿用现有数据。" \
             node scripts/sync-hotfix-items.js --report "$REPORT"
           if [ "$HOTFIX_ONLY" != "true" ]; then
+            # ---- 「今天已跑过」与指纹的辅助函数 ----
+            MARKS=.cache/sync-marks
+            mkdir -p "$MARKS"
+            : > "$PRIV/pending-marks"
+            FORCE=""
+            [ "$FULL" = "true" ] && FORCE="--force"
+            # 这一项今天要不要跑：全量运行、或今天还没记过
+            due() { [ "$FULL" = "true" ] || [ ! -e "$MARKS/$1" ]; }
+            # 工作区里数据产物的快照（已跟踪文件的 diff + 新文件的内容哈希），比较一项跑前跑后有没有改动
+            snap() {
+              { git diff HEAD --binary -- data src/data public/icons public/assets/dungeons
+                git ls-files -o --exclude-standard -- data src/data public/icons public/assets/dungeons \
+                  | while read -r f; do echo "$f $(git hash-object "$f")"; done
+              } | sha1sum
+            }
+            # 一项跑成功之后：没改动就立刻记为跑过；有改动等合并后再记（见 Record sync marks）
+            done_mark() { if [ "$2" = "$(snap)" ]; then touch "$MARKS/$1"; else echo "$1" >> "$PRIV/pending-marks"; fi; }
+            skipped() { echo "- $1：跳过"; printf '### %s\n\n- %s\n\n' "$1" "$2" >> "$REPORT"; }
+            # Wowhead 数据页：build 变了，或今天还没全量跑过（拿不到 build 时按「要跑」处理）
+            wowhead_due() {
+              due "wowhead-$1" && return 0
+              [ "$(node scripts/check-wowhead-build.js --edition "$1" 2>> "$LOG")" != "same" ]
+            }
+
+            # ---- Forever ----
             # 装备、物品、天赋、传承来自 nether 数据页，是同步的主体：失败就整轮失败、不开 PR。
-            for s in "sync-gear-data.js --icons" "sync-item-data.js --icons" "sync-talent-data.js" "sync-legacy-data.js"; do
-              echo "===== $s" >> "$LOG"
-              # shellcheck disable=SC2086
-              if ! node scripts/$s --report "$REPORT" >> "$LOG" 2>&1; then
-                echo "::error::${s%% *} 失败（详情在加密 artifact 里）"
-                exit 1
-              fi
-              echo "✓ ${s%% *}"
-            done
+            if wowhead_due forever; then
+              BEFORE="$(snap)"
+              for s in "sync-gear-data.js --icons" "sync-item-data.js --icons" "sync-talent-data.js" "sync-legacy-data.js"; do
+                echo "===== $s" >> "$LOG"
+                # shellcheck disable=SC2086
+                if ! node scripts/$s --report "$REPORT" >> "$LOG" 2>&1; then
+                  echo "::error::${s%% *} 失败（详情在加密 artifact 里）"
+                  exit 1
+                fi
+                echo "✓ ${s%% *}"
+              done
+              done_mark wowhead-forever "$BEFORE"
+            else
+              skipped "装备 / 物品 / 天赋 / 传承" "客户端 build 没变、今天已全量同步过，本次跳过。"
+            fi
             # 下面几项来自 www.wowhead.com（前面挂着 CloudFront）、wago.tools 或 GitHub，被拦时只跳过这一项。
             step "专业数据" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
               node scripts/sync-profession-data.js --icons --report "$REPORT"
-            # 每次 403 退避要等三分多钟，单独限时 45 分钟（脚本最后才写盘，超时不会留半截数据）。
-            step "副本掉落" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
-              timeout 45m node scripts/sync-zone-loot.js --assets --classic-cache .cache/zone-loot-classic --report "$REPORT"
-            step "首领坐标" "同步失败（wago.tools 不可用），本次跳过，沿用现有坐标。" \
-              node scripts/sync-boss-positions.js --report "$REPORT"
+            # 每次 403 退避要等三分多钟，单独限时 45 分钟（脚本最后才写盘，超时不会留半截数据）。每天跑一次（失败不记，下次再试）。
+            if due zone-loot-forever; then
+              BEFORE="$(snap)"
+              step "副本掉落" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+                timeout 45m node scripts/sync-zone-loot.js --assets --classic-cache .cache/zone-loot-classic --report "$REPORT" \
+                && done_mark zone-loot-forever "$BEFORE"
+            else
+              skipped "副本掉落" "今天已同步过，本次跳过。"
+            fi
             step "职业改动" "同步失败（改动页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
               node scripts/sync-class-changes.js --icons --report "$REPORT"
+            # 上游指纹（cMaNGOS 文件的 ETag + wago build）与上次相同时脚本自己跳过。
+            # shellcheck disable=SC2086
             step "任务数据" "同步失败（cMaNGOS 或 wago 下载失败），本次跳过，沿用现有数据。" \
-              node scripts/sync-quest-data.js --report "$REPORT"
+              node scripts/sync-quest-data.js $FORCE --report "$REPORT"
+
+            # ---- 经典 60 ----
+            # 上游是 Wowhead 的 classic 环境（混着赛季服内容，脚本按版本号 / 1.14 客户端过滤），没有传承、热修、职业改动。
+            # 只在版本号变了时跑（见文件头）；拿不到版本号（被拦）时按「要跑」处理。每一项都软失败。
+            CLASSIC="$(node scripts/check-wowhead-build.js --edition classic --with-wago 2>> "$LOG")"
+            if [ "$FULL" = "true" ] || [ "$CLASSIC" != "same" ]; then
+              echo "经典 60 上游版本：${CLASSIC}"
+              CLASSIC_OK=true
+              step "装备数据（经典 60）" "同步失败，本次跳过，沿用现有数据。" \
+                node scripts/sync-gear-data.js --edition classic --icons --report "$REPORT" || CLASSIC_OK=false
+              # 物品库：CI 没有 tooltip 缓存，只补上次产物里还没有详情的物品。
+              step "物品库（经典 60）" "同步失败，本次跳过，沿用现有数据。" \
+                node scripts/sync-item-data.js --edition classic --icons --report "$REPORT" || CLASSIC_OK=false
+              step "天赋数据（经典 60）" "同步失败（数据页被拦或 wago 不可用），本次跳过，沿用现有数据。" \
+                node scripts/sync-talent-data.js --edition classic --report "$REPORT" || CLASSIC_OK=false
+              step "专业数据（经典 60）" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+                node scripts/sync-profession-data.js --edition classic --icons --report "$REPORT" || CLASSIC_OK=false
+              # 经典副本掉落的页面与上面 Forever 用来补齐的经典旧世页面同名，共用按周缓存；单独限时 20 分钟。
+              step "副本掉落（经典 60）" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+                timeout 20m node scripts/sync-zone-loot.js --edition classic --assets --classic-cache .cache/zone-loot-classic --report "$REPORT" \
+                || CLASSIC_OK=false
+              # 五项都成功才记下这次的版本号（data/classic/upstream.json）；有一项失败就不记，下一轮整组重试。
+              if [ "$CLASSIC_OK" = true ]; then
+                step "经典 60 版本记录" "上游版本号读取失败，本次不更新记录，下一轮重试。" \
+                  node scripts/check-wowhead-build.js --edition classic --stamp
+              fi
+            else
+              skipped "经典 60" "Wowhead 经典数据版本与 wago 经典客户端 build 都没变，本次跳过。"
+            fi
+
+            # ---- 两个版本共用 ----
+            # 首领在副本地图上的位置：两个版本的副本掉落合并起来对位，所以放在最后。build、首领与地图都没变时脚本自己跳过。
+            # shellcheck disable=SC2086
+            step "首领坐标" "同步失败（wago.tools 不可用），本次跳过，沿用现有坐标。" \
+              node scripts/sync-boss-positions.js $FORCE --report "$REPORT"
           fi
           if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -170,11 +278,12 @@ jobs:
       - name: Gate - changed paths
         if: steps.pull.outputs.changed == 'true'
         run: |
-          # 只允许动同步脚本的产物（与私有仓库 ci.yml 历史上的 paths-ignore 清单一致）；输出含文件名，全部进 gate.log
+          # 只允许动同步脚本的产物：两个版本的数据目录（data/<版本>、src/data/<版本>）与共用的图标、副本素材、
+          # 首领坐标、任务数据。私有仓库加了新的数据目录要同时改这里。输出含文件名，全部进 gate.log
           bash -euo pipefail > "$PRIV/gate.log" 2>&1 <<'GATE' || { echo "::error::改动超出数据目录，不开 PR（原因见加密 artifact 里的 gate.log）"; exit 1; }
           BAD=$(git -c core.quotepath=off status --porcelain --untracked-files=all \
             | cut -c4- \
-            | grep -vE '^(data/(gear|items|professions|changes|dungeons|quests)/|public/icons/|public/assets/dungeons/|src/data/(gear-base\.json|legacy\.js|talents\.js|zh-talents\.js)$)' || true)
+            | grep -vE '^(data/(forever|classic|dungeons|quests)/|public/icons/|public/assets/dungeons/|src/data/(forever|classic)/)' || true)
           if [ -n "$BAD" ]; then
             echo "同步改动了数据目录以外的文件："
             echo "$BAD"
@@ -193,7 +302,7 @@ jobs:
         run: |
           set -euo pipefail
           DAY=$(date -u +%F)
-          if [ "$HOTFIX_ONLY" = "true" ]; then WHAT="服务端热修物品数值（Raidbots 缓存）"; else WHAT="上游装备 / 天赋 / 传承等数据"; fi
+          if [ "$HOTFIX_ONLY" = "true" ]; then WHAT="服务端热修物品数值（Raidbots 缓存）"; else WHAT="上游装备 / 天赋 / 传承等数据（Forever + 经典 60）"; fi
           TITLE="chore(data): 同步${WHAT}（${DAY}）"
           if [ "$RELEASE" = "true" ]; then
             NEXT="私有仓库的 CI 在本 PR 上通过后自动合并，并发布新版本、部署上线；CI 没过就停在这里等人处理。"
@@ -217,7 +326,7 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git checkout -B "$SYNC_BRANCH"
             git add -A
-            git commit -m "chore(data): 同步上游装备 / 天赋 / 传承 / 专业 / 副本掉落 / 职业改动 / 任务数据"
+            git commit -m "chore(data): 同步上游装备 / 天赋 / 传承 / 专业 / 副本掉落 / 职业改动 / 任务数据（Forever + 经典 60）"
             git push --force "https://x-access-token:${TOKEN}@github.com/${CONTENT_REPO}.git" "HEAD:refs/heads/${SYNC_BRANCH}"
           } > "$PRIV/push.log" 2>&1 || { echo "::error::推送 ${SYNC_BRANCH} 失败（详情在加密 artifact 里）"; exit 1; }
           PR=$(gh pr list --repo "$CONTENT_REPO" --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')
@@ -266,6 +375,25 @@ jobs:
             || { echo "::error::合并失败（多半是 main 已前进产生冲突），PR 留着人工处理"; exit 1; }
           echo "已合并"
           echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      # 有改动的那几项：改动已经合并进私有仓库 main，才记为今天跑过（没合并时不记，下次重跑，改动继续留在 PR 里）。
+      # 不论成败都另存一份标记（新 key），下次运行从 restore-keys 取当天最近的这份。标记只有项名，不含数据。
+      - name: Record sync marks
+        if: always() && env.HOTFIX_ONLY != 'true'
+        run: |
+          mkdir -p .cache/sync-marks
+          PENDING="${PRIV:-/nonexistent}/pending-marks"
+          if [ "${{ steps.merge.outputs.merged }}" = "true" ] && [ -s "$PENDING" ]; then
+            while read -r m; do touch ".cache/sync-marks/$m"; done < "$PENDING"
+          fi
+          ls .cache/sync-marks
+
+      - name: Save sync marks
+        if: always() && env.HOTFIX_ONLY != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/sync-marks
+          key: sync-marks-${{ steps.week.outputs.day }}-${{ github.run_id }}
 
       - name: Encrypt logs
         if: always()
