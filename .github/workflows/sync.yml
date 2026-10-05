@@ -219,8 +219,8 @@ jobs:
             # shellcheck disable=SC2086
             step "任务数据" "同步失败（cMaNGOS 或 wago 下载失败），本次跳过，沿用现有数据。" \
               node scripts/sync-quest-data.js $FORCE --report "$REPORT"
-            # 阵营声望与坐骑（只有 Forever）：都要逐页抓 www.wowhead.com（60 个阵营页 / 138 个物品页 + tooltip），
-            # 和副本掉落一样每天最多跑一次，被拦只跳过本项。脚本自带 403 退避，最终失败直接报错、不写半截数据。
+            # 阵营声望与坐骑（只有 Forever）：声望每天抓 60 个阵营页，坐骑平时只抓 1 个列表页（物品页增量，见下）。
+            # 和副本掉落一样每天最多跑一次，被拦只跳过本项。脚本最终失败直接报错、不写半截数据。
             if due factions-forever; then
               BEFORE="$(snap)"
               step "阵营声望（Forever）" "同步失败（阵营页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
@@ -229,10 +229,14 @@ jobs:
             else
               skipped "阵营声望（Forever）" "今天已同步过，本次跳过。"
             fi
+            # 坐骑默认增量：平时只抓列表页，物品页只抓新坐骑与列表信息变了的；每月 1 号（当天第一轮）或手动 full 时全量校准。
             if due mounts-forever; then
               BEFORE="$(snap)"
+              MOUNT_FULL=""
+              { [ "$FULL" = "true" ] || [ "$(date -u +%d)" = "01" ]; } && MOUNT_FULL="--full"
+              # shellcheck disable=SC2086
               step "坐骑数据" "同步失败（物品页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
-                node scripts/sync-mount-data.js --icons --report "$REPORT" \
+                node scripts/sync-mount-data.js $MOUNT_FULL --icons --report "$REPORT" \
                 && done_mark mounts-forever "$BEFORE"
             else
               skipped "坐骑数据" "今天已同步过，本次跳过。"
