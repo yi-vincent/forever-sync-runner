@@ -6,20 +6,24 @@ name: Sync data
 # tag 由 PAT 推送，会正常触发私有仓库的 deploy.yml（先跑一遍 CI，再构建镜像部署）。
 #
 # 公开仓库的日志与 artifact 谁都能看，所以：
-#   - 同步脚本、git、gh 的输出一律重定向到 $PRIV（runner 临时目录），日志里只写通过 / 失败 / 有无变化；
+#   - 同步脚本、git、gh 的输出一律重定向到 $PRIV（runner 临时目录），日志里只写通过 / 失败 / 有无变化，
+#     外加每一项的用时、退出码和失败类型（HTTP 状态码 / 超时 / 网络错误码）——不含 URL、不含数据；
 #   - 变更报告只写进私有仓库的 PR 正文，不进 step summary；
 #   - artifact 用 ARTIFACT_PASSPHRASE 加密后才上传，没配口令就不上传；
+#   - 失败项的日志末尾推飞书（secrets.FEISHU_WEBHOOK，开了签名校验再配 FEISHU_SIGN_SECRET），消息内容不进公开日志；
 #   - 文件名、PR 号之类不写进 $GITHUB_ENV（那里的变量会在后续每个步骤开头打印到日志）；
 #   - 只允许 schedule / workflow_dispatch 触发，不接任何 PR 事件（fork 拿不到 secrets，也碰不到这里）。
 #
+# 每一项同步都软失败：出错只跳过这一项、沿用现有数据，在 PR 报告里注明并推飞书，后面的项和开 PR / 合并 / 发版照常走。
 # 两个版本：Forever（data/forever、src/data/forever）先跑；经典 60（--edition classic → data/classic、src/data/classic）
-# 排在后面、每一项都软失败，经典出问题不影响 Forever 照常更新。两个版本共用的：public/icons、public/assets/dungeons、
+# 排在后面。两个版本共用的：public/icons、public/assets/dungeons、
 # data/dungeons（首领坐标，等两个版本的副本掉落都跑完再对位）、data/quests。
 #
 # 不是每一项每次都全量拉（手动运行勾选「全量」时例外，一律照跑）：
 #   · 任务、首领坐标：脚本先算上游指纹，与产物 meta.input 相同就跳过。
 #   · Forever 的装备 / 物品 / 天赋 / 传承（Wowhead 数据页）：先看数据页上的客户端 build（scripts/check-wowhead-build.js），
 #     变了立刻跑；没变时每天（UTC 日期）至少全量跑一次 —— Wowhead 改数据不一定升 build，不能只看它。
+#     四项全部成功才记为今天跑过，有一项失败下一轮四项照跑。
 #   · Forever 的副本掉落（几百个页面，耗时大头）：每天跑一次。
 #   · 经典 60 已经稳定，只按版本号同步：Wowhead 经典数据版本与 wago 经典客户端 build（wow_classic_era）
 #     任意一个变了，五项（装备 / 物品 / 天赋 / 专业 / 副本掉落）一起跑；都没变就全部跳过 —— 有依据地跑，不按日期猜。
@@ -141,21 +145,55 @@ jobs:
       - name: Pull upstream data
         id: pull
         run: |
-          set -uo pipefail
+          # 不用 -e：GitHub 默认用 bash -e 跑，step 失败时 return 1 会让整步退出，后面的项、开 PR、发版全被跳过
+          # （2026-10-07 run #33：职业改动被 CloudFront 403，副本掉落跑了 20 分钟的结果也没进 PR）。
+          # 每一项失败只跳过它自己，由 step 记下来；这一步本身始终成功退出。
+          set +e -uo pipefail
           REPORT="$PRIV/report.md"
           LOG="$PRIV/sync.log"
+          ITEMS="$PRIV/items"       # 每一项单独一份完整输出
+          FAILS="$PRIV/failures"    # 每个失败项一份：项名、原因、说明、日志末尾 → Notify Feishu 推送
+          mkdir -p "$ITEMS" "$FAILS"
           : > "$REPORT"
-          # 每一项的输出都进 $LOG；失败的项只在报告里注明、沿用现有数据，日志里只记一行通过 / 跳过。
+          printf '项\t退出码\t秒\t开始（UTC）\n' > "$PRIV/timeline.tsv"
+          N=0
+          FAILED=""
+          fmt_dur() { if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi; }
+          # 失败类型：只取状态码 / 错误码这类不含数据的信息，能进公开日志
+          why_failed() {
+            local code
+            [ "$1" -eq 124 ] && { echo "超时"; return; }
+            code="$(grep -oE 'HTTP [0-9]{3}|E(CONNRESET|TIMEDOUT|NOTFOUND|AI_AGAIN|CONNREFUSED|PIPE)' "$2" | tail -n 1)"
+            echo "退出码 $1${code:+，$code}"
+          }
+          # 跑一项：输出进 $ITEMS/NN.log 并追加到 $LOG；公开日志只写通过 / 失败、用时和失败类型。
+          # 失败的项在报告里注明、沿用现有数据，返回非 0 只给调用处判断（&& done_mark / || CLASSIC_OK=false），不中断流程。
           step() {
             local name="$1" note="$2"; shift 2
-            echo "===== $name" >> "$LOG"
-            if "$@" >> "$LOG" 2>&1; then
-              echo "✓ $name"
-            else
-              echo "::warning::$name 失败，本次跳过（详情在加密 artifact 里）"
-              printf '### %s\n\n- ⚠ %s\n\n' "$name" "$note" >> "$REPORT"
-              return 1
+            local id out t0 start rc dur why
+            N=$((N + 1)); id="$(printf '%02d' "$N")"; out="$ITEMS/$id.log"
+            t0=$SECONDS; start="$(date -u +%FT%TZ)"
+            { echo "===== [$id] $name  $start"; echo "\$ $*"; } >> "$LOG"
+            "$@" > "$out" 2>&1
+            rc=$?
+            dur=$((SECONDS - t0))
+            cat "$out" >> "$LOG"
+            echo "===== [$id] $name 结束：退出码 $rc，用时 $(fmt_dur "$dur")" >> "$LOG"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$rc" "$dur" "$start" >> "$PRIV/timeline.tsv"
+            if [ "$rc" -eq 0 ]; then
+              echo "✓ $name（$(fmt_dur "$dur")）"
+              return 0
             fi
+            why="$(why_failed "$rc" "$out")"
+            echo "::warning::$name 失败，本次跳过（${why}，用时 $(fmt_dur "$dur")；详情在加密 artifact 和飞书里）"
+            printf '### %s\n\n- ⚠ %s\n\n' "$name" "$note" >> "$REPORT"
+            { echo "✗ $name（${why}，用时 $(fmt_dur "$dur")，开始于 $start）"
+              echo "$note"
+              echo "--- 日志末尾 ---"
+              tail -n 40 "$out"
+            } > "$FAILS/$id.txt"
+            FAILED="${FAILED:+$FAILED、}$name"
+            return "$rc"
           }
           step "服务端热修" "同步失败（Raidbots 缓存不可用），本次跳过，沿用现有数据。" \
             node scripts/sync-hotfix-items.js --report "$REPORT"
@@ -185,19 +223,20 @@ jobs:
             }
 
             # ---- Forever ----
-            # 装备、物品、天赋、传承来自 nether 数据页，是同步的主体：失败就整轮失败、不开 PR。
+            # 装备、物品、天赋、传承来自 nether 数据页，是同步的主体。和其它项一样单项软失败（物品库读的是装备数据的
+            # 落盘产物，装备失败时用的是现有那份）；四项全部成功才记为今天跑过，有一项失败下一轮四项照跑。
             if wowhead_due forever; then
               BEFORE="$(snap)"
-              for s in "sync-gear-data.js --icons" "sync-item-data.js --icons" "sync-talent-data.js" "sync-legacy-data.js"; do
-                echo "===== $s" >> "$LOG"
-                # shellcheck disable=SC2086
-                if ! node scripts/$s --report "$REPORT" >> "$LOG" 2>&1; then
-                  echo "::error::${s%% *} 失败（详情在加密 artifact 里）"
-                  exit 1
-                fi
-                echo "✓ ${s%% *}"
-              done
-              done_mark wowhead-forever "$BEFORE"
+              CORE_OK=true
+              step "装备数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
+                node scripts/sync-gear-data.js --icons --report "$REPORT" || CORE_OK=false
+              step "物品库" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
+                node scripts/sync-item-data.js --icons --report "$REPORT" || CORE_OK=false
+              step "天赋数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
+                node scripts/sync-talent-data.js --report "$REPORT" || CORE_OK=false
+              step "传承数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
+                node scripts/sync-legacy-data.js --report "$REPORT" || CORE_OK=false
+              [ "$CORE_OK" = true ] && done_mark wowhead-forever "$BEFORE"
             else
               skipped "装备 / 物品 / 天赋 / 传承" "客户端 build 没变、今天已全量同步过，本次跳过。"
             fi
@@ -286,6 +325,11 @@ jobs:
             echo "### 上游数据没有变化" >> "$GITHUB_STEP_SUMMARY"
             echo "上游数据没有变化"
           fi
+          if [ -n "$FAILED" ]; then
+            echo "- 失败并跳过：${FAILED}（沿用现有数据，日志末尾已推飞书）" >> "$GITHUB_STEP_SUMMARY"
+            echo "本轮失败并跳过：${FAILED}"
+          fi
+          exit 0
 
       # 本周第一次全量同步拉到的经典旧世页面存起来（脚本中途失败也存：已拉到的页面都是完整的，缺的下次补拉）。
       - name: Save classic page cache
@@ -298,6 +342,7 @@ jobs:
           key: ${{ steps.week.outputs.key }}
 
       - name: Gate - changed paths
+        id: gate
         if: steps.pull.outputs.changed == 'true'
         run: |
           # 只允许动同步脚本的产物：两个版本的数据目录（data/<版本>、src/data/<版本>）与共用的图标、副本素材、
@@ -417,6 +462,82 @@ jobs:
           path: .cache/sync-marks
           key: sync-marks-${{ steps.week.outputs.day }}-${{ github.run_id }}
 
+      # 有同步项失败（已跳过）、或流程本身出错（拉数据异常退出 / 闸门 / 推送开 PR / 等 CI 合并）时推一条飞书：
+      # 每个失败项的原因、用时和日志末尾 40 行。消息内容只发飞书，不进公开日志；推送失败只记警告，不影响本次运行结果。
+      - name: Notify Feishu
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NO: ${{ github.run_number }}
+          JOB_STATUS: ${{ job.status }}
+          PULL: ${{ steps.pull.outcome }}
+          GATE: ${{ steps.gate.outcome }}
+          PR_STEP: ${{ steps.pr.outcome }}
+          MERGE: ${{ steps.merge.outcome }}
+        run: |
+          set +e -uo pipefail   # 推送失败（curl 出错等）也不能让这一步失败
+          PRIV="${PRIV:-${RUNNER_TEMP}/private}"
+          FAILS="$PRIV/failures"
+          mkdir -p "$FAILS"
+          # 流程步骤失败：标题 + 相关日志末尾（文件名以 z 开头，排在同步项后面）
+          flow_fail() {
+            local key="$1" title="$2"; shift 2
+            { echo "✗ $title"; echo "--- 日志末尾 ---"
+              for f in "$@"; do [ -s "$f" ] && tail -n 40 "$f"; done
+            } > "$FAILS/z-$key.txt"
+          }
+          [ "$PULL" = failure ] && flow_fail pull "拉取上游数据：步骤异常退出" "$PRIV/sync.log"
+          [ "$GATE" = failure ] && flow_fail gate "闸门：改动超出数据目录，没开 PR" "$PRIV/gate.log"
+          [ "$PR_STEP" = failure ] && flow_fail pr "推送 bot/data-sync / 开 PR 失败" "$PRIV/push.log" "$PRIV/pr.err"
+          [ "$MERGE" = failure ] && flow_fail merge "等 CI / 合并失败，PR 留着人工处理，没发版" "$PRIV/ci-watch.log" "$PRIV/merge.log"
+          shopt -s nullglob
+          files=("$FAILS"/*.txt)
+          if [ ${#files[@]} -eq 0 ] && [ "$JOB_STATUS" = failure ]; then
+            flow_fail other "其他步骤失败（配置 / checkout / 缓存），见运行记录"
+            files=("$FAILS"/*.txt)
+          fi
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "没有失败项，不推送"
+            exit 0
+          fi
+          if [ -z "$WEBHOOK" ]; then
+            echo "::warning::未配置 FEISHU_WEBHOOK，${#files[@]} 条失败记录没推飞书"
+            exit 0
+          fi
+          if [ "$JOB_STATUS" = success ]; then
+            HEAD="⚠ 数据同步 #${RUN_NO}：${#files[@]} 项失败，已跳过，其余照常"
+          else
+            HEAD="❌ 数据同步 #${RUN_NO}：流程中断"
+          fi
+          # 去掉终端颜色码、遮掉可能混进来的 token；单行截到 300 字节、全文 15000 字节（飞书请求体上限 20KB），
+          # 截断可能切坏的半个汉字由 iconv -c 丢掉。
+          { echo "$HEAD"; echo "$RUN_URL"
+            for f in "${files[@]}"; do echo; echo "━━━━━━━━━━"; cat "$f"; done
+          } | sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g; s#x-access-token:[^@]*@#x-access-token:***@#g; s#(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}#***#g' \
+            | cut -c1-300 | head -c 15000 | iconv -c -f UTF-8 -t UTF-8 > "$PRIV/feishu.txt"
+          # 飞书签名：拿 "<timestamp>\n<secret>" 当 HMAC-SHA256 的密钥、对空串签名，base64
+          if [ -n "$SIGN_SECRET" ]; then
+            TS="$(date +%s)"
+            SIGN="$(printf '' | openssl dgst -sha256 -hmac "$(printf '%s\n%s' "$TS" "$SIGN_SECRET")" -binary | base64)"
+            jq -n --rawfile t "$PRIV/feishu.txt" --arg ts "$TS" --arg s "$SIGN" \
+              '{timestamp: $ts, sign: $s, msg_type: "text", content: {text: $t}}' > "$PRIV/feishu.json"
+          else
+            jq -n --rawfile t "$PRIV/feishu.txt" '{msg_type: "text", content: {text: $t}}' > "$PRIV/feishu.json"
+          fi
+          rm -f "$PRIV/feishu.resp"
+          HTTP="$(curl -sS -m 20 -X POST -H 'Content-Type: application/json' --data-binary @"$PRIV/feishu.json" \
+            -o "$PRIV/feishu.resp" -w '%{http_code}' "$WEBHOOK" 2> "$PRIV/feishu.err")"
+          CODE="$(jq -r '.code // .StatusCode // empty' "$PRIV/feishu.resp" 2>/dev/null)"
+          if [ "$HTTP" = 200 ] && [ "${CODE:-0}" = 0 ]; then
+            echo "已推送飞书：${#files[@]} 条失败记录"
+          elif [ "$HTTP" = 200 ]; then
+            echo "::warning::飞书拒收（code ${CODE}；19021 = 签名不对或没配 FEISHU_SIGN_SECRET，19024 = 消息里没有机器人设的关键词）"
+          else
+            echo "::warning::飞书推送失败（HTTP ${HTTP:-—}，webhook 连不上或地址不对）"
+          fi
+
       - name: Encrypt logs
         if: always()
         env:
@@ -481,6 +602,37 @@ jobs:
           } > "$LOG" 2>&1 || { echo "::error::发版失败"; exit 1; }
           echo "### 已发版：$(git describe --tags --abbrev=0)，私有仓库 deploy.yml 接着部署" >> "$GITHUB_STEP_SUMMARY"
           echo "已发版"
+
+      # 发版失败推飞书（数据已合并进 main，只是没升版本 / 没部署）。签名与截断同 sync 里的 Notify Feishu。
+      - name: Notify Feishu on failure
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NO: ${{ github.run_number }}
+        run: |
+          set +e -uo pipefail
+          [ -n "$WEBHOOK" ] || { echo "::warning::未配置 FEISHU_WEBHOOK，发版失败没推飞书"; exit 0; }
+          OUT="${RUNNER_TEMP}/feishu"
+          { echo "❌ 数据同步 #${RUN_NO}：数据已合并，发版失败（没升版本、没部署）"; echo "$RUN_URL"
+            echo; echo "--- release.log 末尾 ---"
+            tail -n 40 "${RUNNER_TEMP}/release.log" 2>/dev/null
+          } | sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g; s#x-access-token:[^@]*@#x-access-token:***@#g; s#(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}#***#g' \
+            | cut -c1-300 | head -c 15000 | iconv -c -f UTF-8 -t UTF-8 > "$OUT.txt"
+          if [ -n "$SIGN_SECRET" ]; then
+            TS="$(date +%s)"
+            SIGN="$(printf '' | openssl dgst -sha256 -hmac "$(printf '%s\n%s' "$TS" "$SIGN_SECRET")" -binary | base64)"
+            jq -n --rawfile t "$OUT.txt" --arg ts "$TS" --arg s "$SIGN" \
+              '{timestamp: $ts, sign: $s, msg_type: "text", content: {text: $t}}' > "$OUT.json"
+          else
+            jq -n --rawfile t "$OUT.txt" '{msg_type: "text", content: {text: $t}}' > "$OUT.json"
+          fi
+          rm -f "$OUT.resp"
+          HTTP="$(curl -sS -m 20 -X POST -H 'Content-Type: application/json' --data-binary @"$OUT.json" \
+            -o "$OUT.resp" -w '%{http_code}' "$WEBHOOK" 2> /dev/null)"
+          CODE="$(jq -r '.code // .StatusCode // empty' "$OUT.resp" 2>/dev/null)"
+          if [ "$HTTP" = 200 ] && [ "${CODE:-0}" = 0 ]; then echo "已推送飞书"; else echo "::warning::飞书推送失败（HTTP ${HTTP:-—}，code ${CODE:-—}）"; fi
 
   keepalive:
     if: github.event.schedule == '17 3 1 * *'
