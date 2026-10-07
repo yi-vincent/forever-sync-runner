@@ -10,7 +10,8 @@ name: Sync data
 #     外加每一项的用时、退出码和失败类型（HTTP 状态码 / 超时 / 网络错误码）——不含 URL、不含数据；
 #   - 变更报告只写进私有仓库的 PR 正文，不进 step summary；
 #   - artifact 用 ARTIFACT_PASSPHRASE 加密后才上传，没配口令就不上传；
-#   - 失败项的日志末尾推飞书（secrets.FEISHU_WEBHOOK，开了签名校验再配 FEISHU_SIGN_SECRET），消息内容不进公开日志；
+#   - 结果推飞书卡片（secrets.FEISHU_WEBHOOK，开了签名校验再配 FEISHU_SIGN_SECRET）：失败项附原因与日志末尾、CI 没过附 CI 报错；
+#     更新合并发版后由私有仓库 deploy.yml 推「已上线」。卡片由私有仓库 scripts/notify-feishu.js 拼，消息内容不进公开日志；
 #   - 文件名、PR 号之类不写进 $GITHUB_ENV（那里的变量会在后续每个步骤开头打印到日志）；
 #   - 只允许 schedule / workflow_dispatch 触发，不接任何 PR 事件（fork 拿不到 secrets，也碰不到这里）。
 #
@@ -97,6 +98,7 @@ jobs:
           fi
           PRIV="${RUNNER_TEMP}/private"
           mkdir -p "$PRIV"
+          date +%s > "$PRIV/t0"   # 飞书卡片里的用时
           echo "PRIV=${PRIV}" >> "$GITHUB_ENV"
           echo "热修模式：${HOTFIX_ONLY}；自动发版：${RELEASE}"
 
@@ -408,6 +410,7 @@ jobs:
             echo "已开 PR"
           fi
           echo "number=$PR" >> "$GITHUB_OUTPUT"
+          echo "$PR" > "$PRIV/pr-number"   # 飞书卡片的 PR 按钮用；不经 env 传，免得进公开日志
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Wait for CI and merge
@@ -433,6 +436,9 @@ jobs:
           fi
           echo "等待私有仓库 CI…"
           if ! gh run watch "$RUN_ID" --repo "$CONTENT_REPO" --exit-status --interval 30 > "$PRIV/ci-watch.log" 2>&1; then
+            # 失败步骤的日志（「job<TAB>step<TAB>时间戳 内容」→「step | 内容」），只进 $PRIV 和飞书
+            gh run view "$RUN_ID" --repo "$CONTENT_REPO" --log-failed 2>&1 \
+              | sed -E $'s/^[^\t]*\t([^\t]*)\t[0-9T:.-]+Z ?/\\1 | /' > "$PRIV/ci-failed.log"
             echo "::error::私有仓库 CI 未通过，PR 留着人工处理，不发版"
             exit 1
           fi
@@ -462,25 +468,39 @@ jobs:
           path: .cache/sync-marks
           key: sync-marks-${{ steps.week.outputs.day }}-${{ github.run_id }}
 
-      # 有同步项失败（已跳过）、或流程本身出错（拉数据异常退出 / 闸门 / 推送开 PR / 等 CI 合并）时推一条飞书：
-      # 每个失败项的原因、用时和日志末尾 40 行。消息内容只发飞书，不进公开日志；推送失败只记警告，不影响本次运行结果。
+      # 推飞书卡片（secrets.FEISHU_WEBHOOK，开了签名校验再配 FEISHU_SIGN_SECRET）。消息内容只发飞书，不进公开日志：
+      #   ❌ 流程中断（拉数据异常退出 / 闸门 / 推送开 PR / 等 CI 合并）：卡在哪，外加相关日志末尾；CI 没过附 CI 报错
+      #   ⚠️ 有同步项失败（已跳过、其余照常）：每项的原因、用时和日志末尾 40 行，外加本轮的数据变更
+      #   📦 有更新但没自动合并（手动运行关了发版）：变更摘要 + PR
+      #   有更新并已合并：这里不推，发版部署完由私有仓库 deploy.yml 推「✅ 数据更新已上线」（带变更摘要），一次更新一条
+      #   没变化、没失败：不推（每两小时一轮，太吵）；仓库变量 FEISHU_NOTIFY_ALL=true 时也推一条 ✅
+      # 卡片由私有仓库的 scripts/notify-feishu.js 拼；checkout 失败没有脚本时退回 curl 发一行纯文本。
+      # 推送失败只记警告，不影响本次运行结果。
       - name: Notify Feishu
         if: always()
         env:
-          WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          NOTIFY_ALL: ${{ vars.FEISHU_NOTIFY_ALL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_NO: ${{ github.run_number }}
           JOB_STATUS: ${{ job.status }}
           PULL: ${{ steps.pull.outcome }}
+          CHANGED: ${{ steps.pull.outputs.changed }}
           GATE: ${{ steps.gate.outcome }}
           PR_STEP: ${{ steps.pr.outcome }}
           MERGE: ${{ steps.merge.outcome }}
+          MERGED: ${{ steps.merge.outputs.merged }}
         run: |
           set +e -uo pipefail   # 推送失败（curl 出错等）也不能让这一步失败
+          if [ -z "$FEISHU_WEBHOOK" ]; then
+            echo "::warning::未配置 FEISHU_WEBHOOK，本轮结果没推飞书"
+            exit 0
+          fi
           PRIV="${PRIV:-${RUNNER_TEMP}/private}"
           FAILS="$PRIV/failures"
-          mkdir -p "$FAILS"
+          N="$PRIV/notify"
+          mkdir -p "$FAILS" "$N"
           # 流程步骤失败：标题 + 相关日志末尾（文件名以 z 开头，排在同步项后面）
           flow_fail() {
             local key="$1" title="$2"; shift 2
@@ -491,52 +511,79 @@ jobs:
           [ "$PULL" = failure ] && flow_fail pull "拉取上游数据：步骤异常退出" "$PRIV/sync.log"
           [ "$GATE" = failure ] && flow_fail gate "闸门：改动超出数据目录，没开 PR" "$PRIV/gate.log"
           [ "$PR_STEP" = failure ] && flow_fail pr "推送 bot/data-sync / 开 PR 失败" "$PRIV/push.log" "$PRIV/pr.err"
-          [ "$MERGE" = failure ] && flow_fail merge "等 CI / 合并失败，PR 留着人工处理，没发版" "$PRIV/ci-watch.log" "$PRIV/merge.log"
+          if [ "$MERGE" = failure ]; then
+            if [ -s "$PRIV/ci-failed.log" ]; then
+              flow_fail merge "私有仓库 CI 没过，PR 留着人工处理，没发版" "$PRIV/ci-failed.log"
+            else
+              flow_fail merge "等 CI / 合并失败，PR 留着人工处理，没发版" "$PRIV/ci-watch.log" "$PRIV/merge.log"
+            fi
+          fi
           shopt -s nullglob
           files=("$FAILS"/*.txt)
           if [ ${#files[@]} -eq 0 ] && [ "$JOB_STATUS" = failure ]; then
             flow_fail other "其他步骤失败（配置 / checkout / 缓存），见运行记录"
             files=("$FAILS"/*.txt)
           fi
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "没有失败项，不推送"
+
+          COLOR=""
+          if [ "$JOB_STATUS" = cancelled ]; then
+            TITLE="⏹ 数据同步 #${RUN_NO}：被取消（手动取消或超时）"; COLOR=grey
+          elif [ "$JOB_STATUS" != success ]; then
+            TITLE="❌ 数据同步 #${RUN_NO}：流程中断"
+          elif [ ${#files[@]} -gt 0 ]; then
+            TITLE="⚠️ 数据同步 #${RUN_NO}：${#files[@]} 项失败，已跳过，其余照常"
+          elif [ "$CHANGED" = true ] && [ "$MERGED" != true ]; then
+            TITLE="📦 数据同步 #${RUN_NO}：有更新，PR 待合并"
+          elif [ "$NOTIFY_ALL" = true ]; then
+            if [ "$CHANGED" = true ]; then TITLE="✅ 数据同步 #${RUN_NO}：有更新，已合并发版"; else TITLE="✅ 数据同步 #${RUN_NO}：上游无变化"; fi
+          else
+            echo "没有失败项、没有待处理的更新，不推送（更新上线后由私有仓库 deploy.yml 推送）"
             exit 0
           fi
-          if [ -z "$WEBHOOK" ]; then
-            echo "::warning::未配置 FEISHU_WEBHOOK，${#files[@]} 条失败记录没推飞书"
-            exit 0
-          fi
-          if [ "$JOB_STATUS" = success ]; then
-            HEAD="⚠ 数据同步 #${RUN_NO}：${#files[@]} 项失败，已跳过，其余照常"
+
+          # 开头一段：哪种运行、有没有变化、接下来怎样、用时
+          T=""; [ -s "$PRIV/t0" ] && T=$(( $(date +%s) - $(cat "$PRIV/t0") ))
+          RAN=$(tail -n +2 "$PRIV/timeline.tsv" 2>/dev/null | wc -l | tr -d ' ')
+          {
+            if [ "$HOTFIX_ONLY" = true ]; then printf '**只同步服务端热修**'; else printf '**全部上游**'; fi
+            [ "$FULL" = true ] && printf '（手动全量）'
+            printf ' · 跑了 %s 项' "$RAN"
+            [ -n "$T" ] && printf ' · 用时 %dm%02ds' $((T / 60)) $((T % 60))
+            echo
+            if [ "$CHANGED" = true ]; then
+              if [ "$MERGED" = true ]; then echo "数据有更新，已合并，接着发版部署（上线后另有通知）"
+              elif [ "$PR_STEP" = success ] && [ "$RELEASE" != true ]; then echo "数据有更新，本次手动运行关了自动发版，PR 等人工合并"
+              elif [ "$PR_STEP" = success ]; then echo "数据有更新，PR 已开但没合并"
+              else echo "数据有更新，但没开成 PR"
+              fi
+            elif [ "$PULL" = success ]; then
+              echo "上游数据没有变化"
+            fi
+          } > "$N/summary.md"
+
+          ARGS=(--title "$TITLE" --md "$N/summary.md")
+          [ -n "$COLOR" ] && ARGS+=(--color "$COLOR")
+          for f in "${files[@]}"; do ARGS+=(--fail "$f"); done
+          [ "$CHANGED" = true ] && ARGS+=(--report "$PRIV/report.md")
+          ARGS+=(--button "运行记录|${RUN_URL}")
+          [ -s "$PRIV/pr-number" ] && ARGS+=(--button "PR|https://github.com/${CONTENT_REPO}/pull/$(cat "$PRIV/pr-number")")
+
+          if [ -f scripts/notify-feishu.js ]; then
+            node scripts/notify-feishu.js "${ARGS[@]}" > "$N/send.log" 2>&1
+            RC=$?
+            cat "$N/send.log"   # 只有「已推送 / 拒收 + 返回码」，不含消息内容
           else
-            HEAD="❌ 数据同步 #${RUN_NO}：流程中断"
+            # checkout 都没成功：没有脚本，发一行纯文本
+            jq -n --arg t "$TITLE"$'\n'"$RUN_URL" '{msg_type: "text", content: {text: $t}}' > "$N/msg.json"
+            if [ -n "$FEISHU_SIGN_SECRET" ]; then
+              TS="$(date +%s)"
+              SIGN="$(printf '' | openssl dgst -sha256 -hmac "$(printf '%s\n%s' "$TS" "$FEISHU_SIGN_SECRET")" -binary | base64)"
+              jq --arg ts "$TS" --arg s "$SIGN" '. + {timestamp: $ts, sign: $s}' "$N/msg.json" > "$N/msg.signed" && mv "$N/msg.signed" "$N/msg.json"
+            fi
+            curl -sS -m 20 -H 'Content-Type: application/json' --data-binary @"$N/msg.json" "$FEISHU_WEBHOOK" > "$N/send.log" 2>&1
+            grep -qE '"(code|StatusCode)":0' "$N/send.log"; RC=$?
           fi
-          # 去掉终端颜色码、遮掉可能混进来的 token；单行截到 300 字节、全文 15000 字节（飞书请求体上限 20KB），
-          # 截断可能切坏的半个汉字由 iconv -c 丢掉。
-          { echo "$HEAD"; echo "$RUN_URL"
-            for f in "${files[@]}"; do echo; echo "━━━━━━━━━━"; cat "$f"; done
-          } | sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g; s#x-access-token:[^@]*@#x-access-token:***@#g; s#(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}#***#g' \
-            | cut -c1-300 | head -c 15000 | iconv -c -f UTF-8 -t UTF-8 > "$PRIV/feishu.txt"
-          # 飞书签名：拿 "<timestamp>\n<secret>" 当 HMAC-SHA256 的密钥、对空串签名，base64
-          if [ -n "$SIGN_SECRET" ]; then
-            TS="$(date +%s)"
-            SIGN="$(printf '' | openssl dgst -sha256 -hmac "$(printf '%s\n%s' "$TS" "$SIGN_SECRET")" -binary | base64)"
-            jq -n --rawfile t "$PRIV/feishu.txt" --arg ts "$TS" --arg s "$SIGN" \
-              '{timestamp: $ts, sign: $s, msg_type: "text", content: {text: $t}}' > "$PRIV/feishu.json"
-          else
-            jq -n --rawfile t "$PRIV/feishu.txt" '{msg_type: "text", content: {text: $t}}' > "$PRIV/feishu.json"
-          fi
-          rm -f "$PRIV/feishu.resp"
-          HTTP="$(curl -sS -m 20 -X POST -H 'Content-Type: application/json' --data-binary @"$PRIV/feishu.json" \
-            -o "$PRIV/feishu.resp" -w '%{http_code}' "$WEBHOOK" 2> "$PRIV/feishu.err")"
-          CODE="$(jq -r '.code // .StatusCode // empty' "$PRIV/feishu.resp" 2>/dev/null)"
-          if [ "$HTTP" = 200 ] && [ "${CODE:-0}" = 0 ]; then
-            echo "已推送飞书：${#files[@]} 条失败记录"
-          elif [ "$HTTP" = 200 ]; then
-            echo "::warning::飞书拒收（code ${CODE}；19021 = 签名不对或没配 FEISHU_SIGN_SECRET，19024 = 消息里没有机器人设的关键词）"
-          else
-            echo "::warning::飞书推送失败（HTTP ${HTTP:-—}，webhook 连不上或地址不对）"
-          fi
+          [ "$RC" -eq 0 ] || echo "::warning::飞书推送失败（19021 = 签名不对或没配 FEISHU_SIGN_SECRET，19024 = 缺机器人设的关键词）"
 
       - name: Encrypt logs
         if: always()
@@ -603,36 +650,25 @@ jobs:
           echo "### 已发版：$(git describe --tags --abbrev=0)，私有仓库 deploy.yml 接着部署" >> "$GITHUB_STEP_SUMMARY"
           echo "已发版"
 
-      # 发版失败推飞书（数据已合并进 main，只是没升版本 / 没部署）。签名与截断同 sync 里的 Notify Feishu。
+      # 发版失败推飞书（数据已合并进 main，只是没升版本 / 没部署）。发版成功不在这里推：
+      # tag 触发私有仓库 deploy.yml，部署完由它推「✅ 数据更新已上线」或「❌ 网站部署失败」。
       - name: Notify Feishu on failure
         if: failure()
         env:
-          WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_NO: ${{ github.run_number }}
         run: |
           set +e -uo pipefail
-          [ -n "$WEBHOOK" ] || { echo "::warning::未配置 FEISHU_WEBHOOK，发版失败没推飞书"; exit 0; }
-          OUT="${RUNNER_TEMP}/feishu"
-          { echo "❌ 数据同步 #${RUN_NO}：数据已合并，发版失败（没升版本、没部署）"; echo "$RUN_URL"
-            echo; echo "--- release.log 末尾 ---"
-            tail -n 40 "${RUNNER_TEMP}/release.log" 2>/dev/null
-          } | sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g; s#x-access-token:[^@]*@#x-access-token:***@#g; s#(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}#***#g' \
-            | cut -c1-300 | head -c 15000 | iconv -c -f UTF-8 -t UTF-8 > "$OUT.txt"
-          if [ -n "$SIGN_SECRET" ]; then
-            TS="$(date +%s)"
-            SIGN="$(printf '' | openssl dgst -sha256 -hmac "$(printf '%s\n%s' "$TS" "$SIGN_SECRET")" -binary | base64)"
-            jq -n --rawfile t "$OUT.txt" --arg ts "$TS" --arg s "$SIGN" \
-              '{timestamp: $ts, sign: $s, msg_type: "text", content: {text: $t}}' > "$OUT.json"
-          else
-            jq -n --rawfile t "$OUT.txt" '{msg_type: "text", content: {text: $t}}' > "$OUT.json"
-          fi
-          rm -f "$OUT.resp"
-          HTTP="$(curl -sS -m 20 -X POST -H 'Content-Type: application/json' --data-binary @"$OUT.json" \
-            -o "$OUT.resp" -w '%{http_code}' "$WEBHOOK" 2> /dev/null)"
-          CODE="$(jq -r '.code // .StatusCode // empty' "$OUT.resp" 2>/dev/null)"
-          if [ "$HTTP" = 200 ] && [ "${CODE:-0}" = 0 ]; then echo "已推送飞书"; else echo "::warning::飞书推送失败（HTTP ${HTTP:-—}，code ${CODE:-—}）"; fi
+          [ -n "$FEISHU_WEBHOOK" ] || { echo "::warning::未配置 FEISHU_WEBHOOK，发版失败没推飞书"; exit 0; }
+          N="${RUNNER_TEMP}/feishu"
+          mkdir -p "$N"
+          echo "数据已合并进 main，但没升版本、没部署。修好后在私有仓库手动发版（standard-version + 推 release-v* tag）。" > "$N/summary.md"
+          { echo "✗ 升版本 / 推 tag 失败"; tail -n 40 "${RUNNER_TEMP}/release.log" 2>/dev/null; } > "$N/fail.txt"
+          node scripts/notify-feishu.js --title "❌ 数据同步 #${RUN_NO}：数据已合并，发版失败" \
+            --md "$N/summary.md" --fail "$N/fail.txt" --button "运行记录|${RUN_URL}" \
+            || echo "::warning::飞书推送失败（checkout 失败时没有脚本，见运行记录）"
 
   keepalive:
     if: github.event.schedule == '17 3 1 * *'
