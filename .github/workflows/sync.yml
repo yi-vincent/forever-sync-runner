@@ -642,18 +642,23 @@ jobs:
         env:
           TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           LOG="${RUNNER_TEMP}/release.log"
-          {
-            pnpm install --frozen-lockfile
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            # 只升补丁号；版本提交、CHANGELOG、release-v* tag 由 standard-version 生成（配置见私有仓库 package.json）。
-            pnpm exec standard-version --release-as patch
-            # PAT 推的 tag 会触发私有仓库 deploy.yml 的 push tags（GITHUB_TOKEN 推的不会）。
-            git push --follow-tags "https://x-access-token:${TOKEN}@github.com/${CONTENT_REPO}.git" HEAD:main
-          } > "$LOG" 2>&1 || { echo "::error::发版失败"; exit 1; }
-          echo "### 已发版：$(git describe --tags --abbrev=0)，私有仓库 deploy.yml 接着部署" >> "$GITHUB_STEP_SUMMARY"
+          # 输出只进 release.log（失败时推飞书）。不能写成 { … } > log || { … }：|| 左边的命令里 set -e 不生效，
+          # standard-version 打 tag 失败（同名 tag 已存在）也会接着推 main，最后照样报「已发版」。
+          exec 3>&1 > "$LOG" 2>&1
+          trap 'echo "::error::发版失败" >&3' ERR
+          pnpm install --frozen-lockfile
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 只升补丁号；版本提交、CHANGELOG、release-v* tag 由 standard-version 生成（配置见私有仓库 package.json）。
+          pnpm exec standard-version --release-as patch
+          TAG="release-v$(node -p 'require("./package.json").version')"
+          # PAT 推的 tag 会触发私有仓库 deploy.yml 的 push tags（GITHUB_TOKEN 推的不会）。
+          # tag 显式推，且与 main 原子推送：--follow-tags 碰到远端已有同名 tag 会静默跳过，main 升了版本却不部署。
+          git push --atomic "https://x-access-token:${TOKEN}@github.com/${CONTENT_REPO}.git" HEAD:main "refs/tags/${TAG}"
+          exec >&3 2>&1
+          echo "### 已发版：${TAG}，私有仓库 deploy.yml 接着部署" >> "$GITHUB_STEP_SUMMARY"
           echo "已发版"
 
       # 发版失败推飞书（数据已合并进 main，只是没升版本 / 没部署）。发版成功不在这里推：
