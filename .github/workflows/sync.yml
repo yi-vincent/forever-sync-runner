@@ -33,6 +33,9 @@ name: Sync data
 #   「今天跑过了」记在本仓库的 actions 缓存里（.cache/sync-marks/<项>，按日期换 key）。一项跑完没产生改动、或改动已经
 #   合并，才记为跑过；改动还在没合并的 PR 里时不记，下次照跑，免得 PR 被后面的同步覆盖掉这部分改动。
 #   专业、职业改动没有可靠的变化信号，仍然每次都跑。
+#   · 补丁说明（Forever Beta 逐 build 对比 + 服务端热修）每次都调，但脚本自己增量：没有新 build、热修缓存的
+#     Last-Modified 也没变就直接收工，一张表都不下载；有新 build 只算新的一对。不传 --force（全量运行也不传）：
+#     客户端 build 的表不会变，--force 只会把整段窗口重新下载重算一遍（约 120MB），换不来任何东西。
 #
 # 解密 artifact：
 #   openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:PASS -in run-N.tar.gz.enc | tar xzf -
@@ -256,6 +259,9 @@ jobs:
             fi
             step "职业改动" "同步失败（改动页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
               node scripts/sync-class-changes.js --icons --report "$REPORT"
+            # 补丁说明要读职业改动的产物（各职业的法术编号与天赋系名），所以排在它后面。增量与不传 --force 的原因见文件头。
+            step "补丁说明" "同步失败（wago.tools 或 Raidbots 热修缓存不可用），本次跳过，沿用现有数据。" \
+              node scripts/sync-patch-notes.js --report "$REPORT"
             # 上游指纹（cMaNGOS 文件的 ETag + wago build）与上次相同时脚本自己跳过。
             # shellcheck disable=SC2086
             step "任务数据" "同步失败（cMaNGOS 或 wago 下载失败），本次跳过，沿用现有数据。" \
@@ -395,7 +401,7 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git checkout -B "$SYNC_BRANCH"
             git add -A
-            git commit -m "chore(data): 同步上游装备 / 天赋 / 传承 / 专业 / 副本掉落 / 职业改动 / 任务数据（Forever + 经典 60）"
+            git commit -m "chore(data): 同步上游装备 / 天赋 / 传承 / 专业 / 副本掉落 / 职业改动 / 补丁说明 / 任务数据（Forever + 经典 60）"
             git push --force "https://x-access-token:${TOKEN}@github.com/${CONTENT_REPO}.git" "HEAD:refs/heads/${SYNC_BRANCH}"
           } > "$PRIV/push.log" 2>&1 || { echo "::error::推送 ${SYNC_BRANCH} 失败（详情在加密 artifact 里）"; exit 1; }
           PR=$(gh pr list --repo "$CONTENT_REPO" --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')
