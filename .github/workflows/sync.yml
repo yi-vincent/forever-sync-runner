@@ -8,14 +8,14 @@ name: Sync data
 # 公开仓库的日志与 artifact 谁都能看，所以：
 #   - 同步脚本、git、gh 的输出一律重定向到 $PRIV（runner 临时目录），日志里只写通过 / 失败 / 有无变化，
 #     外加每一项的用时、退出码和失败类型（HTTP 状态码 / 超时 / 网络错误码）——不含 URL、不含数据；
-#   - 变更报告只写进私有仓库的 PR 正文，不进 step summary；
+#   - 变更报告只写进私有仓库（PR 正文放摘要，逐条前后对比的完整明细随 PR 提交成 data/sync-report.md），不进 step summary；
 #   - artifact 用 ARTIFACT_PASSPHRASE 加密后才上传，没配口令就不上传；
-#   - 结果推飞书卡片（secrets.FEISHU_WEBHOOK，开了签名校验再配 FEISHU_SIGN_SECRET）：失败项附原因与日志末尾、CI 没过附 CI 报错；
-#     更新合并发版后由私有仓库 deploy.yml 推「已上线」。卡片由私有仓库 scripts/notify-feishu.js 拼，消息内容不进公开日志；
+#   - 结果推企业微信卡片（secrets.NOTIFY_WEBHOOK，自建 Message Pusher 转发，点详情看完整内容）：失败项附原因与日志末尾、CI 没过附 CI 报错；
+#     更新合并发版后由私有仓库 deploy.yml 推「已上线」。消息由私有仓库 scripts/notify.js 拼，内容不进公开日志；
 #   - 文件名、PR 号之类不写进 $GITHUB_ENV（那里的变量会在后续每个步骤开头打印到日志）；
 #   - 只允许 schedule / workflow_dispatch 触发，不接任何 PR 事件（fork 拿不到 secrets，也碰不到这里）。
 #
-# 每一项同步都软失败：出错只跳过这一项、沿用现有数据，在 PR 报告里注明并推飞书，后面的项和开 PR / 合并 / 发版照常走。
+# 每一项同步都软失败：出错只跳过这一项、沿用现有数据，在 PR 报告里注明并推企业微信，后面的项和开 PR / 合并 / 发版照常走。
 # 两个版本：Forever（data/forever、src/data/forever）先跑；经典 60（--edition classic → data/classic、src/data/classic）
 # 排在后面。两个版本共用的：public/icons、public/assets/dungeons、
 # data/dungeons（首领坐标，等两个版本的副本掉落都跑完再对位）、data/quests。
@@ -101,7 +101,7 @@ jobs:
           fi
           PRIV="${RUNNER_TEMP}/private"
           mkdir -p "$PRIV"
-          date +%s > "$PRIV/t0"   # 飞书卡片里的用时
+          date +%s > "$PRIV/t0"   # 通知里的用时
           echo "PRIV=${PRIV}" >> "$GITHUB_ENV"
           echo "热修模式：${HOTFIX_ONLY}；自动发版：${RELEASE}"
 
@@ -157,7 +157,7 @@ jobs:
           REPORT="$PRIV/report.md"
           LOG="$PRIV/sync.log"
           ITEMS="$PRIV/items"       # 每一项单独一份完整输出
-          FAILS="$PRIV/failures"    # 每个失败项一份：项名、原因、说明、日志末尾 → Notify Feishu 推送
+          FAILS="$PRIV/failures"    # 每个失败项一份：项名、原因、说明、日志末尾 → Notify WeCom 推送
           mkdir -p "$ITEMS" "$FAILS"
           : > "$REPORT"
           # 命令一列给 report-sync-status.js 认数据源（哪个同步脚本、哪个版本），只进私有目录
@@ -191,12 +191,12 @@ jobs:
               return 0
             fi
             why="$(why_failed "$rc" "$out")"
-            echo "::warning::$name 失败，本次跳过（${why}，用时 $(fmt_dur "$dur")；详情在加密 artifact 和飞书里）"
+            echo "::warning::$name 失败，本次跳过（${why}，用时 $(fmt_dur "$dur")；详情在加密 artifact 和企业微信通知里）"
             printf '### %s\n\n- ⚠ %s\n\n' "$name" "$note" >> "$REPORT"
             { echo "✗ $name（${why}，用时 $(fmt_dur "$dur")，开始于 $start）"
               echo "$note"
               echo "--- 日志末尾 ---"
-              tail -n 40 "$out"
+              tail -n 200 "$out"
             } > "$FAILS/$id.txt"
             FAILED="${FAILED:+$FAILED、}$name"
             return "$rc"
@@ -335,7 +335,7 @@ jobs:
             echo "上游数据没有变化"
           fi
           if [ -n "$FAILED" ]; then
-            echo "- 失败并跳过：${FAILED}（沿用现有数据，日志末尾已推飞书）" >> "$GITHUB_STEP_SUMMARY"
+            echo "- 失败并跳过：${FAILED}（沿用现有数据，日志末尾已推企业微信）" >> "$GITHUB_STEP_SUMMARY"
             echo "本轮失败并跳过：${FAILED}"
           fi
           exit 0
@@ -385,6 +385,17 @@ jobs:
           else
             NEXT="本次手动运行关闭了自动发布，请人工合并。"
           fi
+          # report.md 是完整明细（每一条改动的前后对比，见私有仓库 scripts/lib/change-report.js），随 PR 提交成
+          # data/sync-report.md：发版后 deploy.yml 的通知按提交读它。PR 正文放 report-digest.js 截出来的摘要
+          # （每层前 10 条，不超过 GitHub 正文上限）；私有仓库还没有这个脚本时照旧放全文。
+          if [ -f scripts/report-digest.js ]; then
+            node scripts/report-digest.js "$PRIV/report.md" > "$PRIV/report.digest.md"
+            cp "$PRIV/report.md" data/sync-report.md
+            FULL_NOTE="每一条改动的前后对比见本 PR 里的 data/sync-report.md（下面每类只列前 10 条）。"
+          else
+            cp "$PRIV/report.md" "$PRIV/report.digest.md"
+            FULL_NOTE=""
+          fi
           BODY="$PRIV/pr-body.md"
           {
             echo "定时数据同步自动生成：上游数据有更新。"
@@ -393,7 +404,8 @@ jobs:
             echo
             echo "## 变更"
             echo
-            cat "$PRIV/report.md"
+            [ -n "$FULL_NOTE" ] && { echo "$FULL_NOTE"; echo; }
+            cat "$PRIV/report.digest.md"
             echo
             echo "运行记录（日志不含数据；完整日志在加密 artifact 里）：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           } > "$BODY"
@@ -417,7 +429,7 @@ jobs:
             echo "已开 PR"
           fi
           echo "number=$PR" >> "$GITHUB_OUTPUT"
-          echo "$PR" > "$PRIV/pr-number"   # 飞书卡片的 PR 按钮用；不经 env 传，免得进公开日志
+          echo "$PR" > "$PRIV/pr-number"   # 通知里的 PR 链接用；不经 env 传，免得进公开日志
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Wait for CI and merge
@@ -443,7 +455,7 @@ jobs:
           fi
           echo "等待私有仓库 CI…"
           if ! gh run watch "$RUN_ID" --repo "$CONTENT_REPO" --exit-status --interval 30 > "$PRIV/ci-watch.log" 2>&1; then
-            # 失败步骤的日志（「job<TAB>step<TAB>时间戳 内容」→「step | 内容」），只进 $PRIV 和飞书
+            # 失败步骤的日志（「job<TAB>step<TAB>时间戳 内容」→「step | 内容」），只进 $PRIV 和企业微信通知
             gh run view "$RUN_ID" --repo "$CONTENT_REPO" --log-failed 2>&1 \
               | sed -E $'s/^[^\t]*\t([^\t]*)\t[0-9T:.-]+Z ?/\\1 | /' > "$PRIV/ci-failed.log"
             echo "::error::私有仓库 CI 未通过，PR 留着人工处理，不发版"
@@ -491,20 +503,20 @@ jobs:
           path: .cache/sync-marks
           key: sync-marks-${{ steps.week.outputs.day }}-${{ github.run_id }}
 
-      # 推飞书卡片（secrets.FEISHU_WEBHOOK，开了签名校验再配 FEISHU_SIGN_SECRET）。消息内容只发飞书，不进公开日志：
+      # 推企业微信卡片（secrets.NOTIFY_WEBHOOK = 自建 Message Pusher 的 webhook 地址；卡片放概况和失败项，点详情看完整内容）。
+      # 消息内容只发出去，不进公开日志：
       #   ❌ 流程中断（拉数据异常退出 / 闸门 / 推送开 PR / 等 CI 合并）：卡在哪，外加相关日志末尾；CI 没过附 CI 报错
-      #   ⚠️ 有同步项失败（已跳过、其余照常）：每项的原因、用时和日志末尾 40 行，外加本轮的数据变更
+      #   ⚠️ 有同步项失败（已跳过、其余照常）：每项的原因、用时和日志末尾 200 行，外加本轮的数据变更
       #   📦 有更新但没自动合并（手动运行关了发版）：变更摘要 + PR
       #   有更新并已合并：这里不推，发版部署完由私有仓库 deploy.yml 推「✅ 数据更新已上线」（带变更摘要），一次更新一条
-      #   没变化、没失败：不推（每两小时一轮，太吵）；仓库变量 FEISHU_NOTIFY_ALL=true 时也推一条 ✅
-      # 卡片由私有仓库的 scripts/notify-feishu.js 拼；checkout 失败没有脚本时退回 curl 发一行纯文本。
+      #   没变化、没失败：不推（每两小时一轮，太吵）；仓库变量 NOTIFY_ALL=true 时也推一条 ✅
+      # 消息由私有仓库的 scripts/notify.js 拼；checkout 失败没有脚本时退回 curl 发一行纯文本。
       # 推送失败只记警告，不影响本次运行结果。
-      - name: Notify Feishu
+      - name: Notify WeCom
         if: always()
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
-          NOTIFY_ALL: ${{ vars.FEISHU_NOTIFY_ALL }}
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+          NOTIFY_ALL: ${{ vars.NOTIFY_ALL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_NO: ${{ github.run_number }}
           JOB_STATUS: ${{ job.status }}
@@ -516,8 +528,8 @@ jobs:
           MERGED: ${{ steps.merge.outputs.merged }}
         run: |
           set +e -uo pipefail   # 推送失败（curl 出错等）也不能让这一步失败
-          if [ -z "$FEISHU_WEBHOOK" ]; then
-            echo "::warning::未配置 FEISHU_WEBHOOK，本轮结果没推飞书"
+          if [ -z "$NOTIFY_WEBHOOK" ]; then
+            echo "::warning::未配置 NOTIFY_WEBHOOK，本轮结果没推企业微信"
             exit 0
           fi
           PRIV="${PRIV:-${RUNNER_TEMP}/private}"
@@ -528,7 +540,7 @@ jobs:
           flow_fail() {
             local key="$1" title="$2"; shift 2
             { echo "✗ $title"; echo "--- 日志末尾 ---"
-              for f in "$@"; do [ -s "$f" ] && tail -n 40 "$f"; done
+              for f in "$@"; do [ -s "$f" ] && tail -n 200 "$f"; done
             } > "$FAILS/z-$key.txt"
           }
           [ "$PULL" = failure ] && flow_fail pull "拉取上游数据：步骤异常退出" "$PRIV/sync.log"
@@ -548,9 +560,8 @@ jobs:
             files=("$FAILS"/*.txt)
           fi
 
-          COLOR=""
           if [ "$JOB_STATUS" = cancelled ]; then
-            TITLE="⏹ 数据同步 #${RUN_NO}：被取消（手动取消或超时）"; COLOR=grey
+            TITLE="⏹ 数据同步 #${RUN_NO}：被取消（手动取消或超时）"
           elif [ "$JOB_STATUS" != success ]; then
             TITLE="❌ 数据同步 #${RUN_NO}：流程中断"
           elif [ ${#files[@]} -gt 0 ]; then
@@ -585,28 +596,23 @@ jobs:
           } > "$N/summary.md"
 
           ARGS=(--title "$TITLE" --md "$N/summary.md")
-          [ -n "$COLOR" ] && ARGS+=(--color "$COLOR")
           for f in "${files[@]}"; do ARGS+=(--fail "$f"); done
           [ "$CHANGED" = true ] && ARGS+=(--report "$PRIV/report.md")
           ARGS+=(--button "运行记录|${RUN_URL}")
           [ -s "$PRIV/pr-number" ] && ARGS+=(--button "PR|https://github.com/${CONTENT_REPO}/pull/$(cat "$PRIV/pr-number")")
 
-          if [ -f scripts/notify-feishu.js ]; then
-            node scripts/notify-feishu.js "${ARGS[@]}" > "$N/send.log" 2>&1
+          if [ -f scripts/notify.js ]; then
+            node scripts/notify.js "${ARGS[@]}" > "$N/send.log" 2>&1
             RC=$?
-            cat "$N/send.log"   # 只有「已推送 / 拒收 + 返回码」，不含消息内容
+            cat "$N/send.log"   # 只有「已推送 / 被拒 + 原因」，不含消息内容
           else
-            # checkout 都没成功：没有脚本，发一行纯文本
-            jq -n --arg t "$TITLE"$'\n'"$RUN_URL" '{msg_type: "text", content: {text: $t}}' > "$N/msg.json"
-            if [ -n "$FEISHU_SIGN_SECRET" ]; then
-              TS="$(date +%s)"
-              SIGN="$(printf '' | openssl dgst -sha256 -hmac "$(printf '%s\n%s' "$TS" "$FEISHU_SIGN_SECRET")" -binary | base64)"
-              jq --arg ts "$TS" --arg s "$SIGN" '. + {timestamp: $ts, sign: $s}' "$N/msg.json" > "$N/msg.signed" && mv "$N/msg.signed" "$N/msg.json"
-            fi
-            curl -sS -m 20 -H 'Content-Type: application/json' --data-binary @"$N/msg.json" "$FEISHU_WEBHOOK" > "$N/send.log" 2>&1
-            grep -qE '"(code|StatusCode)":0' "$N/send.log"; RC=$?
+            # checkout 都没成功：没有脚本，只发标题，详情页放运行记录链接
+            jq -n --arg t "$TITLE" --arg u "$RUN_URL" \
+              '{title: $t, description: "没拼成完整通知（私有仓库 checkout 失败？），点详情看运行记录", content: "[运行记录](\($u))"}' > "$N/msg.json"
+            curl -sS -m 20 -H 'Content-Type: application/json' --data-binary @"$N/msg.json" "$NOTIFY_WEBHOOK" > "$N/send.log" 2>&1
+            grep -q '"success":true' "$N/send.log"; RC=$?
           fi
-          [ "$RC" -eq 0 ] || echo "::warning::飞书推送失败（19021 = 签名不对或没配 FEISHU_SIGN_SECRET，19024 = 缺机器人设的关键词）"
+          [ "$RC" -eq 0 ] || echo "::warning::企业微信推送失败（「Webhook 构建规则解析失败」= Message Pusher 里这个 webhook 的规则没配成原样透传）"
 
       - name: Encrypt logs
         if: always()
@@ -662,7 +668,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           LOG="${RUNNER_TEMP}/release.log"
-          # 输出只进 release.log（失败时推飞书）。不能写成 { … } > log || { … }：|| 左边的命令里 set -e 不生效，
+          # 输出只进 release.log（失败时推企业微信）。不能写成 { … } > log || { … }：|| 左边的命令里 set -e 不生效，
           # standard-version 打 tag 失败（同名 tag 已存在）也会接着推 main，最后照样报「已发版」。
           exec 3>&1 > "$LOG" 2>&1
           trap 'echo "::error::发版失败" >&3' ERR
@@ -684,25 +690,24 @@ jobs:
           echo "### 已发版：${TAG}，私有仓库 deploy.yml 接着部署" >> "$GITHUB_STEP_SUMMARY"
           echo "已发版"
 
-      # 发版失败推飞书（数据已合并进 main，只是没升版本 / 没部署）。发版成功不在这里推：
+      # 发版失败推企业微信（数据已合并进 main，只是没升版本 / 没部署）。发版成功不在这里推：
       # tag 触发私有仓库 deploy.yml，部署完由它推「✅ 数据更新已上线」或「❌ 网站部署失败」。
-      - name: Notify Feishu on failure
+      - name: Notify WeCom on failure
         if: failure()
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          NOTIFY_WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_NO: ${{ github.run_number }}
         run: |
           set +e -uo pipefail
-          [ -n "$FEISHU_WEBHOOK" ] || { echo "::warning::未配置 FEISHU_WEBHOOK，发版失败没推飞书"; exit 0; }
-          N="${RUNNER_TEMP}/feishu"
+          [ -n "$NOTIFY_WEBHOOK" ] || { echo "::warning::未配置 NOTIFY_WEBHOOK，发版失败没推企业微信"; exit 0; }
+          N="${RUNNER_TEMP}/notify"
           mkdir -p "$N"
           echo "数据已合并进 main，但没升版本、没部署。修好后在私有仓库手动发版（standard-version + 推 release-v* tag）。" > "$N/summary.md"
-          { echo "✗ 升版本 / 推 tag 失败"; tail -n 40 "${RUNNER_TEMP}/release.log" 2>/dev/null; } > "$N/fail.txt"
-          node scripts/notify-feishu.js --title "❌ 数据同步 #${RUN_NO}：数据已合并，发版失败" \
+          { echo "✗ 升版本 / 推 tag 失败"; tail -n 200 "${RUNNER_TEMP}/release.log" 2>/dev/null; } > "$N/fail.txt"
+          node scripts/notify.js --title "❌ 数据同步 #${RUN_NO}：数据已合并，发版失败" \
             --md "$N/summary.md" --fail "$N/fail.txt" --button "运行记录|${RUN_URL}" \
-            || echo "::warning::飞书推送失败（checkout 失败时没有脚本，见运行记录）"
+            || echo "::warning::企业微信推送失败（checkout 失败时没有脚本，见运行记录）"
 
   keepalive:
     if: github.event.schedule == '17 3 1 * *'
