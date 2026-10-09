@@ -160,7 +160,8 @@ jobs:
           FAILS="$PRIV/failures"    # 每个失败项一份：项名、原因、说明、日志末尾 → Notify Feishu 推送
           mkdir -p "$ITEMS" "$FAILS"
           : > "$REPORT"
-          printf '项\t退出码\t秒\t开始（UTC）\n' > "$PRIV/timeline.tsv"
+          # 命令一列给 report-sync-status.js 认数据源（哪个同步脚本、哪个版本），只进私有目录
+          printf '项\t退出码\t秒\t开始（UTC）\t命令\n' > "$PRIV/timeline.tsv"
           N=0
           FAILED=""
           fmt_dur() { if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi; }
@@ -184,7 +185,7 @@ jobs:
             dur=$((SECONDS - t0))
             cat "$out" >> "$LOG"
             echo "===== [$id] $name 结束：退出码 $rc，用时 $(fmt_dur "$dur")" >> "$LOG"
-            printf '%s\t%s\t%s\t%s\n' "$name" "$rc" "$dur" "$start" >> "$PRIV/timeline.tsv"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$rc" "$dur" "$start" "$*" >> "$PRIV/timeline.tsv"
             if [ "$rc" -eq 0 ]; then
               echo "✓ $name（$(fmt_dur "$dur")）"
               return 0
@@ -457,6 +458,22 @@ jobs:
 
       # 有改动的那几项：改动已经合并进私有仓库 main，才记为今天跑过（没合并时不记，下次重跑，改动继续留在 PR 里）。
       # 不论成败都另存一份标记（新 key），下次运行从 restore-keys 取当天最近的这份。标记只有项名，不含数据。
+      # 模块页头的「核对于 …」：本轮跑成功的同步项与完成时间推给站点（私有仓库 scripts/report-sync-status.js →
+      # 站点 POST /api/sync-status）。只在站点数据确实跟上了上游时报：本轮没有改动，或改动已经合并 ——
+      # 拉到了新数据却没合并（CI 没过 / 手动运行不自动发布）时站点上还是旧数据，不能算核对过。
+      # 没配 vars.SITE_URL / secrets.SYNC_STATUS_TOKEN 时脚本只打 warning；上报失败不影响同步。日志只有数据源名。
+      - name: Report sync status
+        if: >-
+          always() && steps.pull.outcome == 'success' &&
+          (steps.pull.outputs.changed != 'true' || steps.merge.outputs.merged == 'true')
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          SYNC_STATUS_TOKEN: ${{ secrets.SYNC_STATUS_TOKEN }}
+        run: |
+          [ -f scripts/report-sync-status.js ] || { echo "私有仓库还没有 report-sync-status.js，跳过"; exit 0; }
+          node scripts/report-sync-status.js "$PRIV/timeline.tsv"
+
       - name: Record sync marks
         if: always() && env.HOTFIX_ONLY != 'true'
         run: |
@@ -641,6 +658,7 @@ jobs:
       - name: Bump version, changelog and tag
         env:
           TOKEN: ${{ secrets.CONTENT_REPO_TOKEN }}
+          SITE_URL: ${{ vars.SITE_URL }}
         run: |
           set -Eeuo pipefail
           LOG="${RUNNER_TEMP}/release.log"
@@ -651,6 +669,11 @@ jobs:
           pnpm install --frozen-lockfile
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 站点上的核对时间取一份烤进 src/data/updates.json（stamp-updates.js 读 SYNC_CHECKS_FILE）：重新部署后站点的
+          # 实时记录可能没了，至少还有发版时这一份。取不到不挡发版（沿用上一份）。
+          if [ -n "${SITE_URL:-}" ] && curl -sf --max-time 20 "${SITE_URL%/}/api/sync-status" -o "${RUNNER_TEMP}/sync-checks.json"; then
+            export SYNC_CHECKS_FILE="${RUNNER_TEMP}/sync-checks.json"
+          fi
           # 只升补丁号；版本提交、CHANGELOG、release-v* tag 由 standard-version 生成（配置见私有仓库 package.json）。
           pnpm exec standard-version --release-as patch
           TAG="release-v$(node -p 'require("./package.json").version')"
