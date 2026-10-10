@@ -42,16 +42,18 @@ name: Sync data
 
 on:
   schedule:
-    # 全部上游：每五小时一次（UTC 0/5/10/15/20 点）。
-    - cron: "0 */5 * * *"
-    # 服务端热修（Raidbots 汇总的客户端缓存，每两小时更新）：隔两小时只跑这一项。错开整点，避开 Raidbots 自己的更新时刻。
+    # 全部上游（含服务端热修）：每两小时一次，UTC 偶数点 :40（北京时间同为偶数点 :40）。
+    # 热修来源 Raidbots 的客户端缓存也是每两小时更新，所以不再单开一条只跑热修的 cron。
+    # 错开整点：一来避开 Raidbots 自己的更新时刻，二来 GitHub 的定时任务整点最挤。但这只能缓解：GitHub 不保证准点，
+    # 负载高时会延后甚至丢轮（2026-10-09 实测 :00 那几轮晚 1.5～5 小时，:40 那几轮晚 1～2 小时，两边都丢过轮）。
+    # 平时大多数项按 build / 每天一次跳过（见上），一轮几分钟；每天第一轮要跑副本掉落等，约 40 分钟。
     - cron: "40 */2 * * *"
     # 保活：公开仓库 60 天没有提交，GitHub 会停掉全部 schedule。每月 1 号提交一次 .keepalive。
     - cron: "17 3 1 * *"
   workflow_dispatch:
     inputs:
       hotfix_only:
-        description: 只同步服务端热修（同两小时那条 cron）
+        description: 只同步服务端热修
         type: boolean
         default: false
       release:
@@ -72,7 +74,7 @@ concurrency:
 
 env:
   CONTENT_REPO: ${{ vars.CONTENT_REPO }}
-  HOTFIX_ONLY: ${{ github.event.schedule == '40 */2 * * *' || (github.event_name == 'workflow_dispatch' && inputs.hotfix_only) }}
+  HOTFIX_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.hotfix_only }}
   RELEASE: ${{ github.event_name == 'schedule' || inputs.release }}
   FULL: ${{ github.event_name == 'workflow_dispatch' && inputs.full }}
   SYNC_BRANCH: bot/data-sync
