@@ -16,6 +16,10 @@ name: Sync data
 #   - 只允许 schedule / workflow_dispatch 触发，不接任何 PR 事件（fork 拿不到 secrets，也碰不到这里）。
 #
 # 每一项同步都软失败：出错只跳过这一项、沿用现有数据，在 PR 报告里注明并推企业微信，后面的项和开 PR / 合并 / 发版照常走。
+# 「出错」也包括数据校验没过：每一项跑完用私有仓库的冒烟检查（scripts/smoke/data.mjs --only <套件>）查它的产物，
+# 上游冒出脏数据（掉率超过 100%、字段缺失、没汉化的分系名…）时把这一项退回跑之前的样子，通知里带冒烟报错、点名是哪条数据。
+# 这样一条脏数据只挡住它自己这一项，其余项照常合并发版；修好同步脚本合进 main 后，下一轮自动把这一项补上。
+# 仍会让 PR 卡在 CI 的只剩逐项校验覆盖不到的：跨模块对不上、vitest / 构建失败 —— 那是代码问题，要人处理。
 # 两个版本：Forever（data/forever、src/data/forever）先跑；经典 60（--edition classic → data/classic、src/data/classic）
 # 排在后面。两个版本共用的：public/icons、public/assets/dungeons、
 # data/dungeons（首领坐标，等两个版本的副本掉落都跑完再对位）、data/quests。
@@ -174,16 +178,43 @@ jobs:
             code="$(grep -oE 'HTTP [0-9]{3}|E(CONNRESET|TIMEDOUT|NOTFOUND|AI_AGAIN|CONNREFUSED|PIPE)' "$2" | tail -n 1)"
             echo "退出码 $1${code:+，$code}"
           }
+          # 数据校验：一项跑成功后，用私有仓库的冒烟检查（scripts/smoke/data.mjs --only <套件> --edition <版本>）查它的产物。
+          # 不过就把这一项退回跑之前的样子，按失败处理：沿用现有数据、报告注明、推企业微信（带冒烟报错，点名是哪条数据），
+          # 后面的项和开 PR / 合并 / 发版照常走 —— 一条上游脏数据只挡住它自己这一项，不再卡住整个 PR
+          # （2026-10-12 PR #64：副本掉落里一条掉率 107.6% 的掉落，让装备、物品、热修等全部更新停在 PR 里等人处理）。
+          # 退回靠 git 索引做检查点：每一项跑完（无论成败）都 git add 进索引；退回 = 工作区按索引还原 + 删掉索引里没有的新文件。
+          # 只动同步产物的目录（与下面 Gate - changed paths 的白名单一致），.cache 在 .gitignore 里，git clean 不碰。
+          DATA_PATHS=(data/forever data/classic data/dungeons data/quests public/icons public/assets/dungeons src/data/forever src/data/classic)
+          checkpoint() { git add -A -- "${DATA_PATHS[@]}"; }
+          rollback() { git checkout -q -- "${DATA_PATHS[@]}"; git clean -fdq -- "${DATA_PATHS[@]}"; }
+          STEP_INVALID=false   # 上一项是不是因为数据校验没过而失败（给 invalid_mark 判断）
           # 跑一项：输出进 $ITEMS/NN.log 并追加到 $LOG；公开日志只写通过 / 失败、用时和失败类型。
           # 失败的项在报告里注明、沿用现有数据，返回非 0 只给调用处判断（&& done_mark / || CLASSIC_OK=false），不中断流程。
+          # 用法：step [--check <冒烟套件>[:<版本>]] <项名> <失败说明> <命令…>；版本默认 forever。
           step() {
+            local check=""
+            if [ "$1" = "--check" ]; then check="$2"; shift 2; fi
             local name="$1" note="$2"; shift 2
-            local id out t0 start rc dur why
+            local id out t0 start rc dur why rsize suite edition
             N=$((N + 1)); id="$(printf '%02d' "$N")"; out="$ITEMS/$id.log"
             t0=$SECONDS; start="$(date -u +%FT%TZ)"
+            STEP_INVALID=false
+            rsize="$(wc -c < "$REPORT")"   # 同步脚本会往报告里追加这一项的改动；退回时一并截掉
             { echo "===== [$id] $name  $start"; echo "\$ $*"; } >> "$LOG"
             "$@" > "$out" 2>&1
             rc=$?
+            if [ "$rc" -eq 0 ] && [ -n "$check" ] && [ -f scripts/smoke/data.mjs ]; then
+              suite="${check%%:*}"; edition="forever"
+              [ "$check" != "$suite" ] && edition="${check#*:}"
+              echo "--- 数据校验：scripts/smoke/data.mjs --only $suite --edition $edition ---" >> "$out"
+              if ! node scripts/smoke/data.mjs --only "$suite" --edition "$edition" >> "$out" 2>&1; then
+                rc=98
+                STEP_INVALID=true
+                rollback
+                truncate -s "$rsize" "$REPORT"
+              fi
+            fi
+            checkpoint
             dur=$((SECONDS - t0))
             cat "$out" >> "$LOG"
             echo "===== [$id] $name 结束：退出码 $rc，用时 $(fmt_dur "$dur")" >> "$LOG"
@@ -192,7 +223,13 @@ jobs:
               echo "✓ $name（$(fmt_dur "$dur")）"
               return 0
             fi
-            why="$(why_failed "$rc" "$out")"
+            if [ "$STEP_INVALID" = true ]; then
+              why="数据校验没通过"
+              note="拉到的数据没通过数据校验，本次不更新这部分，沿用现有数据（多半是上游出了脏数据，要改同步脚本兜住）："
+              note="${note}"$'\n'"$(grep -E '^  ✗ ' "$out" | sed -E 's/^  ✗ /  - /' | head -n 20)"
+            else
+              why="$(why_failed "$rc" "$out")"
+            fi
             echo "::warning::$name 失败，本次跳过（${why}，用时 $(fmt_dur "$dur")；详情在加密 artifact 和企业微信通知里）"
             printf '### %s\n\n- ⚠ %s\n\n' "$name" "$note" >> "$REPORT"
             { echo "✗ $name（${why}，用时 $(fmt_dur "$dur")，开始于 $start）"
@@ -203,7 +240,7 @@ jobs:
             FAILED="${FAILED:+$FAILED、}$name"
             return "$rc"
           }
-          step "服务端热修" "同步失败（Raidbots 缓存不可用），本次跳过，沿用现有数据。" \
+          step --check hotfix "服务端热修" "同步失败（Raidbots 缓存不可用），本次跳过，沿用现有数据。" \
             node scripts/sync-hotfix-items.js --report "$REPORT"
           if [ "$HOTFIX_ONLY" != "true" ]; then
             # ---- 「今天已跑过」与指纹的辅助函数 ----
@@ -212,8 +249,18 @@ jobs:
             : > "$PRIV/pending-marks"
             FORCE=""
             [ "$FULL" = "true" ] && FORCE="--force"
-            # 这一项今天要不要跑：全量运行、或今天还没记过
-            due() { [ "$FULL" = "true" ] || [ ! -e "$MARKS/$1" ]; }
+            # 同步 / 校验代码的版本：scripts 与 src/lib（冒烟检查读 src/lib/instance-list.ts 等）两棵树的哈希。
+            code_rev() { echo "$(git rev-parse HEAD:scripts) $(git rev-parse HEAD:src/lib)"; }
+            # 这一项今天要不要跑：全量运行、或今天还没记过、或上次是数据校验没过而代码已经改了（见 invalid_mark）。
+            # 正常的标记是空文件；校验没过的标记里写着当时的 code_rev。
+            due() {
+              [ "$FULL" = "true" ] || [ ! -e "$MARKS/$1" ] \
+                || { [ -s "$MARKS/$1" ] && [ "$(cat "$MARKS/$1")" != "$(code_rev)" ]; }
+            }
+            # 一项因为数据校验没过而失败时：上游的脏数据不会自己变好，同一份代码今天再跑还是同样结果（副本掉落一轮四十分钟），
+            # 所以记下代码版本，今天不再跑；修好同步脚本合进 main 后 code_rev 变了，下一轮自动重跑。第二天照常重跑。
+            # 这一项已经退回、PR 里没有它的改动，跳过它不会让 PR 丢东西。网络类失败不记，下一轮照常重试。
+            invalid_mark() { if [ "$STEP_INVALID" = true ]; then code_rev > "$MARKS/$1"; fi; }
             # 工作区里数据产物的快照（已跟踪文件的 diff + 新文件的内容哈希），比较一项跑前跑后有没有改动
             snap() {
               { git diff HEAD --binary -- data src/data public/icons public/assets/dungeons
@@ -222,7 +269,8 @@ jobs:
               } | sha1sum
             }
             # 一项跑成功之后：没改动就立刻记为跑过；有改动等合并后再记（见 Record sync marks）
-            done_mark() { if [ "$2" = "$(snap)" ]; then touch "$MARKS/$1"; else echo "$1" >> "$PRIV/pending-marks"; fi; }
+            # 写空文件而不是 touch：盖掉之前 invalid_mark 写进去的代码版本
+            done_mark() { if [ "$2" = "$(snap)" ]; then : > "$MARKS/$1"; else echo "$1" >> "$PRIV/pending-marks"; fi; }
             skipped() { echo "- $1：跳过"; printf '### %s\n\n- %s\n\n' "$1" "$2" >> "$REPORT"; }
             # Wowhead 数据页：build 变了，或今天还没全量跑过（拿不到 build 时按「要跑」处理）
             wowhead_due() {
@@ -236,46 +284,46 @@ jobs:
             if wowhead_due forever; then
               BEFORE="$(snap)"
               CORE_OK=true
-              step "装备数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
+              step --check gear "装备数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
                 node scripts/sync-gear-data.js --icons --report "$REPORT" || CORE_OK=false
-              step "物品库" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
+              step --check items "物品库" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
                 node scripts/sync-item-data.js --icons --report "$REPORT" || CORE_OK=false
-              step "天赋数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
+              step --check talents "天赋数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
                 node scripts/sync-talent-data.js --report "$REPORT" || CORE_OK=false
-              step "传承数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
+              step --check legacy "传承数据" "同步失败（Wowhead 数据页不可用），本次跳过，沿用现有数据。" \
                 node scripts/sync-legacy-data.js --report "$REPORT" || CORE_OK=false
               [ "$CORE_OK" = true ] && done_mark wowhead-forever "$BEFORE"
             else
               skipped "装备 / 物品 / 天赋 / 传承" "客户端 build 没变、今天已全量同步过，本次跳过。"
             fi
             # 下面几项来自 www.wowhead.com（前面挂着 CloudFront）、wago.tools 或 GitHub，被拦时只跳过这一项。
-            step "专业数据" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+            step --check professions "专业数据" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
               node scripts/sync-profession-data.js --icons --report "$REPORT"
             # 每次 403 退避要等三分多钟，单独限时 45 分钟（脚本最后才写盘，超时不会留半截数据）。每天跑一次（失败不记，下次再试）。
             if due zone-loot-forever; then
               BEFORE="$(snap)"
-              step "副本掉落" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+              step --check zones "副本掉落" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 timeout 45m node scripts/sync-zone-loot.js --assets --classic-cache .cache/zone-loot-classic --report "$REPORT" \
-                && done_mark zone-loot-forever "$BEFORE"
+                && done_mark zone-loot-forever "$BEFORE" || invalid_mark zone-loot-forever
             else
               skipped "副本掉落" "今天已同步过，本次跳过。"
             fi
-            step "职业改动" "同步失败（改动页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+            step --check changes "职业改动" "同步失败（改动页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
               node scripts/sync-class-changes.js --icons --report "$REPORT"
             # 补丁说明要读职业改动的产物（各职业的法术编号与天赋系名），所以排在它后面。增量与不传 --force 的原因见文件头。
-            step "补丁说明" "同步失败（wago.tools 或 Raidbots 热修缓存不可用），本次跳过，沿用现有数据。" \
+            step --check patchNotes "补丁说明" "同步失败（wago.tools 或 Raidbots 热修缓存不可用），本次跳过，沿用现有数据。" \
               node scripts/sync-patch-notes.js --report "$REPORT"
             # 上游指纹（cMaNGOS 文件的 ETag + wago build）与上次相同时脚本自己跳过。
             # shellcheck disable=SC2086
-            step "任务数据" "同步失败（cMaNGOS 或 wago 下载失败），本次跳过，沿用现有数据。" \
+            step --check quests "任务数据" "同步失败（cMaNGOS 或 wago 下载失败），本次跳过，沿用现有数据。" \
               node scripts/sync-quest-data.js $FORCE --report "$REPORT"
             # 阵营声望与坐骑（只有 Forever）：声望每天抓 60 个阵营页，坐骑平时只抓 1 个列表页（物品页增量，见下）。
             # 和副本掉落一样每天最多跑一次，被拦只跳过本项。脚本最终失败直接报错、不写半截数据。
             if due factions-forever; then
               BEFORE="$(snap)"
-              step "阵营声望（Forever）" "同步失败（阵营页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+              step --check factions "阵营声望（Forever）" "同步失败（阵营页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 node scripts/sync-forever-factions.js --icons --report "$REPORT" \
-                && done_mark factions-forever "$BEFORE"
+                && done_mark factions-forever "$BEFORE" || invalid_mark factions-forever
             else
               skipped "阵营声望（Forever）" "今天已同步过，本次跳过。"
             fi
@@ -285,9 +333,9 @@ jobs:
               MOUNT_FULL=""
               { [ "$FULL" = "true" ] || [ "$(date -u +%d)" = "01" ]; } && MOUNT_FULL="--full"
               # shellcheck disable=SC2086
-              step "坐骑数据" "同步失败（物品页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+              step --check mounts "坐骑数据" "同步失败（物品页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 node scripts/sync-mount-data.js $MOUNT_FULL --icons --report "$REPORT" \
-                && done_mark mounts-forever "$BEFORE"
+                && done_mark mounts-forever "$BEFORE" || invalid_mark mounts-forever
             else
               skipped "坐骑数据" "今天已同步过，本次跳过。"
             fi
@@ -299,17 +347,17 @@ jobs:
             if [ "$FULL" = "true" ] || [ "$CLASSIC" != "same" ]; then
               echo "经典 60 上游版本：${CLASSIC}"
               CLASSIC_OK=true
-              step "装备数据（经典 60）" "同步失败，本次跳过，沿用现有数据。" \
+              step --check gear:classic "装备数据（经典 60）" "同步失败，本次跳过，沿用现有数据。" \
                 node scripts/sync-gear-data.js --edition classic --icons --report "$REPORT" || CLASSIC_OK=false
               # 物品库：CI 没有 tooltip 缓存，只补上次产物里还没有详情的物品。
-              step "物品库（经典 60）" "同步失败，本次跳过，沿用现有数据。" \
+              step --check items:classic "物品库（经典 60）" "同步失败，本次跳过，沿用现有数据。" \
                 node scripts/sync-item-data.js --edition classic --icons --report "$REPORT" || CLASSIC_OK=false
-              step "天赋数据（经典 60）" "同步失败（数据页被拦或 wago 不可用），本次跳过，沿用现有数据。" \
+              step --check talents:classic "天赋数据（经典 60）" "同步失败（数据页被拦或 wago 不可用），本次跳过，沿用现有数据。" \
                 node scripts/sync-talent-data.js --edition classic --report "$REPORT" || CLASSIC_OK=false
-              step "专业数据（经典 60）" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+              step --check professions:classic "专业数据（经典 60）" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 node scripts/sync-profession-data.js --edition classic --icons --report "$REPORT" || CLASSIC_OK=false
               # 经典副本掉落的页面与上面 Forever 用来补齐的经典旧世页面同名，共用按周缓存；单独限时 20 分钟。
-              step "副本掉落（经典 60）" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+              step --check zones:classic "副本掉落（经典 60）" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 timeout 20m node scripts/sync-zone-loot.js --edition classic --assets --classic-cache .cache/zone-loot-classic --report "$REPORT" \
                 || CLASSIC_OK=false
               # 五项都成功才记下这次的版本号（data/classic/upstream.json）；有一项失败就不记，下一轮整组重试。
@@ -324,7 +372,7 @@ jobs:
             # ---- 两个版本共用 ----
             # 首领在副本地图上的位置：两个版本的副本掉落合并起来对位，所以放在最后。build、首领与地图都没变时脚本自己跳过。
             # shellcheck disable=SC2086
-            step "首领坐标" "同步失败（wago.tools 不可用），本次跳过，沿用现有坐标。" \
+            step --check dungeonArt "首领坐标" "同步失败（wago.tools 不可用），本次跳过，沿用现有坐标。" \
               node scripts/sync-boss-positions.js $FORCE --report "$REPORT"
           fi
           if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
@@ -500,7 +548,7 @@ jobs:
           mkdir -p .cache/sync-marks
           PENDING="${PRIV:-/nonexistent}/pending-marks"
           if [ "${{ steps.merge.outputs.merged }}" = "true" ] && [ -s "$PENDING" ]; then
-            while read -r m; do touch ".cache/sync-marks/$m"; done < "$PENDING"
+            while read -r m; do : > ".cache/sync-marks/$m"; done < "$PENDING"
           fi
           ls .cache/sync-marks
 
