@@ -7,7 +7,7 @@ name: Sync data
 #
 # 公开仓库的日志与 artifact 谁都能看，所以：
 #   - 同步脚本、git、gh 的输出一律重定向到 $PRIV（runner 临时目录），日志里只写通过 / 失败 / 有无变化，
-#     外加每一项的用时、退出码和失败类型（HTTP 状态码 / 超时 / 网络错误码）——不含 URL、不含数据；
+#     外加每一项的用时、退出码和失败类型（HTTP 状态码 / 超时 / 网络错误码，带出错请求的域名）——不含 URL 路径和参数、不含数据；
 #   - 变更报告只写进私有仓库（PR 正文放摘要，逐条前后对比的完整明细随 PR 提交成 data/sync-report.md），不进 step summary；
 #   - artifact 用 ARTIFACT_PASSPHRASE 加密后才上传，没配口令就不上传；
 #   - 结果推企业微信卡片（secrets.NOTIFY_WEBHOOK，自建 Message Pusher 转发，点详情看完整内容）：失败项附原因与日志末尾、CI 没过附 CI 报错；
@@ -171,12 +171,17 @@ jobs:
           N=0
           FAILED=""
           fmt_dur() { if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi; }
-          # 失败类型：只取状态码 / 错误码这类不含数据的信息，能进公开日志
+          # 失败类型：只取状态码 / 错误码这类不含数据的信息，能进公开日志。
+          # 同一条报错里带着地址时（「HTTP 503 https://wago.tools/db2/…」「getaddrinfo ENOTFOUND wago.tools」）把域名也带上，
+          # 一眼看出是 Wowhead、wago 还是别的上游拦的；路径和参数（物品号、build 号）不要
+          # （2026-10-12 起 run #66：十几项同时 202 / 503，公开日志看不出各是哪个站返回的）。
           why_failed() {
-            local code
+            local hit code host
             [ "$1" -eq 124 ] && { echo "超时"; return; }
-            code="$(grep -oE 'HTTP [0-9]{3}|E(CONNRESET|TIMEDOUT|NOTFOUND|AI_AGAIN|CONNREFUSED|PIPE)' "$2" | tail -n 1)"
-            echo "退出码 $1${code:+，$code}"
+            hit="$(grep -oE 'HTTP [0-9]{3}( https?://[A-Za-z0-9.-]+)?|E(CONNRESET|TIMEDOUT|NOTFOUND|AI_AGAIN|CONNREFUSED|PIPE)( [A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})?' "$2" | tail -n 1)"
+            code="$(sed -E 's#^(HTTP [0-9]{3}|E[A-Z_]+).*#\1#' <<< "$hit")"
+            host="$(sed -E 's#^(HTTP [0-9]{3}|E[A-Z_]+) ?(https?://)?##' <<< "$hit")"
+            echo "退出码 $1${code:+，$code}${host:+（$host）}"
           }
           # 数据校验：一项跑成功后，用私有仓库的冒烟检查（scripts/smoke/data.mjs --only <套件> --edition <版本>）查它的产物。
           # 不过就把这一项退回跑之前的样子，按失败处理：沿用现有数据、报告注明、推企业微信（带冒烟报错，点名是哪条数据），
