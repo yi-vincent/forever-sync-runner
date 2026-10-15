@@ -36,7 +36,8 @@ name: Sync data
 #     五项全部成功才更新记录，随 PR 合并进 main；没合并时 main 上还是旧号，下一轮照样重试。
 #   「今天跑过了」记在本仓库的 actions 缓存里（.cache/sync-marks/<项>，按日期换 key）。一项跑完没产生改动、或改动已经
 #   合并，才记为跑过；改动还在没合并的 PR 里时不记，下次照跑，免得 PR 被后面的同步覆盖掉这部分改动。
-#   专业、职业改动没有可靠的变化信号，仍然每次都跑。
+#   · 专业（12 个技能页）、职业改动（18 个改动页）来自 www.wowhead.com，内容跟客户端 build 走：build 变了立刻跑，
+#     没变时每 12 小时最多一次（UTC 上下半天各一槽，标记名带槽号）。以前每轮都跑，一天 360 个页面换不来几次改动。
 #   · 补丁说明（Forever Beta 逐 build 对比 + 服务端热修）每次都调，但脚本自己增量：没有新 build、热修缓存的
 #     Last-Modified 也没变就直接收工，一张表都不下载；有新 build 只算新的一对。不传 --force（全量运行也不传）：
 #     客户端 build 的表不会变，--force 只会把整段窗口重新下载重算一遍（约 120MB），换不来任何东西。
@@ -277,11 +278,14 @@ jobs:
             # 写空文件而不是 touch：盖掉之前 invalid_mark 写进去的代码版本
             done_mark() { if [ "$2" = "$(snap)" ]; then : > "$MARKS/$1"; else echo "$1" >> "$PRIV/pending-marks"; fi; }
             skipped() { echo "- $1：跳过"; printf '### %s\n\n- %s\n\n' "$1" "$2" >> "$REPORT"; }
-            # Wowhead 数据页：build 变了，或今天还没全量跑过（拿不到 build 时按「要跑」处理）
-            wowhead_due() {
-              due "wowhead-$1" && return 0
-              [ "$(node scripts/check-wowhead-build.js --edition "$1" 2>> "$LOG")" != "same" ]
-            }
+            # Forever 的客户端 build 变了没：整轮只查一次（1 个 nether 数据页），装备四项、专业、职业改动都看它。
+            # 必须在装备四项跑之前查 —— 物品库跑完会把新版本号写进产物，之后再查就是 same 了。拿不到 build 时按「变了」处理。
+            BUILD_CHANGED=false
+            [ "$(node scripts/check-wowhead-build.js --edition forever 2>> "$LOG")" != "same" ] && BUILD_CHANGED=true
+            # 每 12 小时一次的项用的槽号：UTC 0–11 点是 0，12–23 点是 1。标记按天换 key，所以一天里就这两个槽。
+            HALF=$(( 10#$(date -u +%H) < 12 ? 0 : 1 ))
+            # Wowhead 数据页：build 变了，或今天还没全量跑过
+            wowhead_due() { [ "$BUILD_CHANGED" = true ] || due "wowhead-$1"; }
 
             # ---- Forever ----
             # 装备、物品、天赋、传承来自 nether 数据页，是同步的主体。和其它项一样单项软失败（物品库读的是装备数据的
@@ -302,8 +306,15 @@ jobs:
               skipped "装备 / 物品 / 天赋 / 传承" "客户端 build 没变、今天已全量同步过，本次跳过。"
             fi
             # 下面几项来自 www.wowhead.com（前面挂着 CloudFront）、wago.tools 或 GitHub，被拦时只跳过这一项。
-            step --check professions "专业数据" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
-              node scripts/sync-profession-data.js --icons --report "$REPORT"
+            # 专业：build 变了立刻跑，没变时每 12 小时一次（见文件头）。网络类失败不记标记，下一轮照常重试。
+            if [ "$BUILD_CHANGED" = true ] || due "professions-forever-$HALF"; then
+              BEFORE="$(snap)"
+              step --check professions "专业数据" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+                node scripts/sync-profession-data.js --icons --report "$REPORT" \
+                && done_mark "professions-forever-$HALF" "$BEFORE" || invalid_mark "professions-forever-$HALF"
+            else
+              skipped "专业数据" "客户端 build 没变、这 12 小时已同步过，本次跳过。"
+            fi
             # 每次 403 退避要等三分多钟，单独限时 45 分钟（脚本最后才写盘，超时不会留半截数据）。每天跑一次（失败不记，下次再试）。
             if due zone-loot-forever; then
               BEFORE="$(snap)"
@@ -313,8 +324,15 @@ jobs:
             else
               skipped "副本掉落" "今天已同步过，本次跳过。"
             fi
-            step --check changes "职业改动" "同步失败（改动页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
-              node scripts/sync-class-changes.js --icons --report "$REPORT"
+            # 职业改动：同专业，build 变了立刻跑，没变时每 12 小时一次。跳过时补丁说明读的是现有产物。
+            if [ "$BUILD_CHANGED" = true ] || due "changes-forever-$HALF"; then
+              BEFORE="$(snap)"
+              step --check changes "职业改动" "同步失败（改动页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+                node scripts/sync-class-changes.js --icons --report "$REPORT" \
+                && done_mark "changes-forever-$HALF" "$BEFORE" || invalid_mark "changes-forever-$HALF"
+            else
+              skipped "职业改动" "客户端 build 没变、这 12 小时已同步过，本次跳过。"
+            fi
             # 补丁说明要读职业改动的产物（各职业的法术编号与天赋系名），所以排在它后面。增量与不传 --force 的原因见文件头。
             step --check patchNotes "补丁说明" "同步失败（wago.tools 或 Raidbots 热修缓存不可用），本次跳过，沿用现有数据。" \
               node scripts/sync-patch-notes.js --report "$REPORT"
