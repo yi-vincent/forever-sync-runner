@@ -31,9 +31,10 @@ name: Sync data
 #     四项全部成功才记为今天跑过，有一项失败下一轮四项照跑。
 #   · Forever 的副本掉落（几百个页面，耗时大头）：每天跑一次。
 #   · 经典 60 已经稳定，只按版本号同步：Wowhead 经典数据版本与 wago 经典客户端 build（wow_classic_era）
-#     任意一个变了，五项（装备 / 物品 / 天赋 / 专业 / 副本掉落）一起跑；都没变就全部跳过 —— 有依据地跑，不按日期猜。
+#     任意一个变了，四项（装备 / 物品 / 天赋 / 副本掉落）一起跑；都没变就全部跳过 —— 有依据地跑，不按日期猜。
+#     经典专业例外：技能页早已定型，每月 1 号（UTC）跑一次，不看版本号、全量运行也不跑。
 #     两个号记在私有仓库的 data/classic/upstream.json（scripts/check-wowhead-build.js --with-wago / --stamp），
-#     五项全部成功才更新记录，随 PR 合并进 main；没合并时 main 上还是旧号，下一轮照样重试。
+#     四项全部成功才更新记录，随 PR 合并进 main；没合并时 main 上还是旧号，下一轮照样重试。
 #   「今天跑过了」记在本仓库的 actions 缓存里（.cache/sync-marks/<项>，按日期换 key）。一项跑完没产生改动、或改动已经
 #   合并，才记为跑过；改动还在没合并的 PR 里时不记，下次照跑，免得 PR 被后面的同步覆盖掉这部分改动。
 #   · 专业（12 个技能页）、职业改动（18 个改动页）来自 www.wowhead.com，内容跟客户端 build 走：build 变了立刻跑，
@@ -66,7 +67,7 @@ on:
         type: boolean
         default: true
       full:
-        description: 全量：忽略「今天已跑过」与上游指纹，每一项都照跑
+        description: 全量：忽略「今天已跑过」与上游指纹，每一项都照跑（经典 60 专业除外，只在每月 1 号跑）
         type: boolean
         default: true
 
@@ -381,19 +382,29 @@ jobs:
                 node scripts/sync-item-data.js --edition classic --icons --report "$REPORT" || CLASSIC_OK=false
               step --check talents:classic "天赋数据（经典 60）" "同步失败（数据页被拦或 wago 不可用），本次跳过，沿用现有数据。" \
                 node scripts/sync-talent-data.js --edition classic --report "$REPORT" || CLASSIC_OK=false
-              step --check professions:classic "专业数据（经典 60）" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
-                node scripts/sync-profession-data.js --edition classic --icons --report "$REPORT" || CLASSIC_OK=false
               # 经典副本掉落的页面与上面 Forever 用来补齐的经典旧世页面同名，共用按周缓存；单独限时 20 分钟。
               step --check zones:classic "副本掉落（经典 60）" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 timeout 20m node scripts/sync-zone-loot.js --edition classic --assets --classic-cache .cache/zone-loot-classic --report "$REPORT" \
                 || CLASSIC_OK=false
-              # 五项都成功才记下这次的版本号（data/classic/upstream.json）；有一项失败就不记，下一轮整组重试。
+              # 四项都成功才记下这次的版本号（data/classic/upstream.json）；有一项失败就不记，下一轮整组重试。
               if [ "$CLASSIC_OK" = true ]; then
                 step "经典 60 版本记录" "上游版本号读取失败，本次不更新记录，下一轮重试。" \
                   node scripts/check-wowhead-build.js --edition classic --stamp
               fi
             else
               skipped "经典 60" "Wowhead 经典数据版本与 wago 经典客户端 build 都没变，本次跳过。"
+            fi
+            # 专业（经典 60）：技能页早已定型，每月 1 号（UTC）跑一次就够，不跟版本号走，全量运行也不强制跑
+            # （10-17 run #90 全量时它紧跟副本掉落的几百页被 403）。1 号当天跑成功记为跑过（标记按天换 key，
+            # 只管当天）；失败当天后面几轮照常重试，校验没过的处理同 due / invalid_mark。
+            if [ "$(date -u +%d)" = "01" ] && { [ ! -e "$MARKS/professions-classic" ] \
+                || { [ -s "$MARKS/professions-classic" ] && [ "$(cat "$MARKS/professions-classic")" != "$(code_rev)" ]; }; }; then
+              BEFORE="$(snap)"
+              step --check professions:classic "专业数据（经典 60）" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
+                node scripts/sync-profession-data.js --edition classic --icons --report "$REPORT" \
+                && done_mark professions-classic "$BEFORE" || invalid_mark professions-classic
+            else
+              skipped "专业数据（经典 60）" "技能页早已定型，每月 1 号（UTC）才同步，本次跳过。"
             fi
 
             # ---- 两个版本共用 ----
