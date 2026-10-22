@@ -46,8 +46,8 @@ name: Sync data
 # aws-waf-token：www.wowhead.com 的 Forever 实体页 10-17 起要带它才放行，一两天就过期。2026-10-22 起每轮自动收割
 # （下面 Harvest aws-waf-token 步骤）：xvfb 跑有头 Chromium 过一遍 WAF 挑战，token 写进 checkout 出来的私有仓库根
 # .wowhead-cookie（lib/upstream.js 的 fetchPage 读它）。无头浏览器会被 WAF 直接 403（连挑战页都不发，私有仓库
-# scripts/fetch-waf-token.js 实测），必须 xvfb 跑有头。收割失败回退 secrets.WOWHEAD_COOKIE（pnpm cookie --auto 换的那份），
-# 行为与从前一致。playwright 与 Chromium 每轮装进 runner 临时目录（约一分钟），不进 workspace（闸门只放数据目录）。
+# scripts/fetch-waf-token.js 实测），必须 xvfb 跑有头。收割失败时没有 token，要 token 的项软失败、沿用现有数据，
+# 下一轮自动重收重试。playwright 与 Chromium 每轮装进 runner 临时目录（约一分钟），不进 workspace（闸门只放数据目录）。
 # 暂停开关 vars.PAUSE_WOWHEAD_PAGES = true：Forever 的专业、副本掉落、阵营声望、坐骑四项整个跳过，沿用现有数据，
 # 报告里写「已暂停」（四项全是这批要 token 的实体页，收割再稳也有被 CloudFront 限流的时候，留个总闸）；
 # 恢复：gh variable delete PAUSE_WOWHEAD_PAGES（或设成 false），下一轮照常跑（当天的标记没记，会立刻补跑）。
@@ -166,7 +166,7 @@ jobs:
           key: sync-marks-${{ steps.week.outputs.day }}-${{ github.run_id }}
           restore-keys: sync-marks-${{ steps.week.outputs.day }}-
 
-      # aws-waf-token 自动收割（见文件头）：失败不挡同步，回退 secrets.WOWHEAD_COOKIE。同步 job 不装私有仓库的依赖
+      # aws-waf-token 自动收割（见文件头）：失败不挡同步，要 token 的项软失败，下一轮重试。同步 job 不装私有仓库的依赖
       # （脚本只用内置模块），playwright 装进 runner 临时目录、NODE_PATH 让 fetch-waf-token.js 找得到；浏览器也装在
       # 临时目录（PLAYWRIGHT_BROWSERS_PATH），不进 workspace。输出进 $PRIV，公开日志只写结果与用时。
       - name: Harvest aws-waf-token
@@ -193,16 +193,13 @@ jobs:
             echo "✓ aws-waf-token 已自动收割（用时 $((SECONDS - t0))s），本轮同步用浏览器请求头 + 新 token"
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::aws-waf-token 自动收割失败（详情在加密 artifact 里），回退 secrets.WOWHEAD_COOKIE"
+            echo "::warning::aws-waf-token 自动收割失败（详情在加密 artifact 里），要 token 的项本次跳过，下一轮重试"
           fi
 
+      # www.wowhead.com 的 Forever 实体页 10-17 起要 aws-waf-token：上面 Harvest 步骤写的 .wowhead-cookie（私有仓库根）
+      # 是唯一来源，lib/upstream.js 的 fetchPage 读它；收割失败时没有 token，要 token 的项软失败，下一轮重收重试。
       - name: Pull upstream data
         id: pull
-        env:
-          # 2026-10-17 起 www.wowhead.com 的 Forever 页只放行带 aws-waf-token 的请求：私有仓库 lib/upstream.js 的 fetchPage
-          # 用浏览器请求头 + cookie。优先用上面 Harvest 步骤自动收割的 .wowhead-cookie；收割失败 / 跳过（只跑热修）时
-          # 才注入这份手动维护的 secret（pnpm cookie --auto 会更新它）。两者都没有就退回脚本 UA。
-          WOWHEAD_COOKIE: ${{ steps.waf.outputs.ok != 'true' && secrets.WOWHEAD_COOKIE || '' }}
         run: |
           # 不用 -e：GitHub 默认用 bash -e 跑，step 失败时 return 1 会让整步退出，后面的项、开 PR、发版全被跳过
           # （2026-10-07 run #33：职业改动被 CloudFront 403，副本掉落跑了 20 分钟的结果也没进 PR）。
