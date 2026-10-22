@@ -43,6 +43,11 @@ name: Sync data
 #     Last-Modified 也没变就直接收工，一张表都不下载；有新 build 只算新的一对。不传 --force（全量运行也不传）：
 #     客户端 build 的表不会变，--force 只会把整段窗口重新下载重算一遍（约 120MB），换不来任何东西。
 #
+# 暂停开关 vars.PAUSE_WOWHEAD_PAGES = true：Forever 的专业、副本掉落、阵营声望、坐骑四项整个跳过，沿用现有数据，报告里写「已暂停」。
+# 这四项抓的是 www.wowhead.com 的 Forever 实体页，10-17 起要带浏览器里拿到的 aws-waf-token（一两天就过期，
+# secrets.WOWHEAD_COOKIE 要人手动换），失败率一半上下，副本掉落一跑三十多分钟。2026-10-22 起先停掉；
+# 恢复：gh variable delete PAUSE_WOWHEAD_PAGES（或设成 false），下一轮照常跑（今天的标记没记，会立刻补跑）。
+#
 # 解密 artifact：
 #   openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -pass env:PASS -in run-N.tar.gz.enc | tar xzf -
 
@@ -84,6 +89,8 @@ env:
   RELEASE: ${{ github.event_name == 'schedule' || inputs.release }}
   FULL: ${{ github.event_name == 'workflow_dispatch' && inputs.full }}
   SYNC_BRANCH: bot/data-sync
+  # 暂停依赖 www.wowhead.com 实体页的四项，见文件头。
+  PAUSE_WOWHEAD_PAGES: ${{ vars.PAUSE_WOWHEAD_PAGES }}
 
 jobs:
   sync:
@@ -283,6 +290,8 @@ jobs:
             # 写空文件而不是 touch：盖掉之前 invalid_mark 写进去的代码版本
             done_mark() { if [ "$2" = "$(snap)" ]; then : > "$MARKS/$1"; else echo "$1" >> "$PRIV/pending-marks"; fi; }
             skipped() { echo "- $1：跳过"; printf '### %s\n\n- %s\n\n' "$1" "$2" >> "$REPORT"; }
+            # 暂停开关打开时（vars.PAUSE_WOWHEAD_PAGES，见文件头），这四项不跑也不记标记。
+            paused() { [ "${PAUSE_WOWHEAD_PAGES:-}" = "true" ] && skipped "$1" "已暂停，本次跳过（vars.PAUSE_WOWHEAD_PAGES）：要 Wowhead 的浏览器 token，沿用现有数据。"; }
             # Forever 的客户端 build 变了没：整轮只查一次（1 个 nether 数据页），装备四项、专业、职业改动都看它。
             # 必须在装备四项跑之前查 —— 物品库跑完会把新版本号写进产物，之后再查就是 same 了。拿不到 build 时按「变了」处理。
             BUILD_CHANGED=false
@@ -312,7 +321,8 @@ jobs:
             fi
             # 下面几项来自 www.wowhead.com（前面挂着 CloudFront）、wago.tools 或 GitHub，被拦时只跳过这一项。
             # 专业：build 变了立刻跑，没变时每 12 小时一次（见文件头）。网络类失败不记标记，下一轮照常重试。
-            if [ "$BUILD_CHANGED" = true ] || due "professions-forever-$HALF"; then
+            if paused "专业数据"; then :
+            elif [ "$BUILD_CHANGED" = true ] || due "professions-forever-$HALF"; then
               BEFORE="$(snap)"
               step --check professions "专业数据" "同步失败（技能页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 node scripts/sync-profession-data.js --icons --report "$REPORT" \
@@ -321,7 +331,8 @@ jobs:
               skipped "专业数据" "客户端 build 没变、这 12 小时已同步过，本次跳过。"
             fi
             # 每次 403 退避要等三分多钟，单独限时 45 分钟（脚本最后才写盘，超时不会留半截数据）。每天跑一次（失败不记，下次再试）。
-            if due zone-loot-forever; then
+            if paused "副本掉落"; then :
+            elif due zone-loot-forever; then
               BEFORE="$(snap)"
               step --check zones "副本掉落" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 timeout 45m node scripts/sync-zone-loot.js --assets --classic-cache .cache/zone-loot-classic --report "$REPORT" \
@@ -347,7 +358,8 @@ jobs:
               node scripts/sync-quest-data.js $FORCE --report "$REPORT"
             # 阵营声望与坐骑（只有 Forever）：声望每天抓 60 个阵营页，坐骑平时只抓 1 个列表页（物品页增量，见下）。
             # 和副本掉落一样每天最多跑一次，被拦只跳过本项。脚本最终失败直接报错、不写半截数据。
-            if due factions-forever; then
+            if paused "阵营声望（Forever）"; then :
+            elif due factions-forever; then
               BEFORE="$(snap)"
               step --check factions "阵营声望（Forever）" "同步失败（阵营页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
                 node scripts/sync-forever-factions.js --icons --report "$REPORT" \
@@ -356,7 +368,8 @@ jobs:
               skipped "阵营声望（Forever）" "今天已同步过，本次跳过。"
             fi
             # 坐骑默认增量：平时只抓列表页，物品页只抓新坐骑与列表信息变了的；每月 1 号（当天第一轮）或手动 full 时全量校准。
-            if due mounts-forever; then
+            if paused "坐骑数据"; then :
+            elif due mounts-forever; then
               BEFORE="$(snap)"
               MOUNT_FULL=""
               { [ "$FULL" = "true" ] || [ "$(date -u +%d)" = "01" ]; } && MOUNT_FULL="--full"
