@@ -23,6 +23,7 @@ name: Sync data
 # 两个版本：Forever（data/forever、src/data/forever）先跑；经典 60（--edition classic → data/classic、src/data/classic）
 # 排在后面。两个版本共用的：public/icons、public/assets/dungeons、
 # data/dungeons（首领坐标，等两个版本的副本掉落都跑完再对位）、data/quests。
+# 时光服物价行情（data/titan/item-price，来自蓝色隐士 trt 只读接口，不走 Wowhead）每天（UTC 日期）跑一次，见下。
 #
 # 不是每一项每次都全量拉（手动运行勾选「全量」时例外，一律照跑）：
 #   · 任务、首领坐标：脚本先算上游指纹，与产物 meta.input 相同就跳过。
@@ -30,6 +31,8 @@ name: Sync data
 #     变了立刻跑；没变时每天（UTC 日期）至少全量跑一次 —— Wowhead 改数据不一定升 build，不能只看它。
 #     四项全部成功才记为今天跑过，有一项失败下一轮四项照跑。
 #   · Forever 的副本掉落（几百个页面，耗时大头）：每天跑一次。
+#   · 时光服物价行情（scripts/sync-titan-item-price.mjs，约 800 个请求、几分钟）：每天一次，当天第一轮跑。脚本整批校验通过才写盘
+#     （index.json 与 detail.json 一起落盘），被拦 / 校验不过 / 物品数缩水超过 30% 时退出 1 且不动旧文件，本项按软失败处理、沿用昨天的快照。
 #   · 经典 60 已经稳定，只按版本号同步：Wowhead 经典数据版本与 wago 经典客户端 build（wow_classic_era）
 #     任意一个变了，四项（装备 / 物品 / 天赋 / 副本掉落）一起跑；都没变就全部跳过 —— 有依据地跑，不按日期猜。
 #     经典专业例外：技能页早已定型，每月 1 号（UTC）跑一次，不看版本号、全量运行也不跑。
@@ -234,7 +237,7 @@ jobs:
           # （2026-10-12 PR #64：副本掉落里一条掉率 107.6% 的掉落，让装备、物品、热修等全部更新停在 PR 里等人处理）。
           # 退回靠 git 索引做检查点：每一项跑完（无论成败）都 git add 进索引；退回 = 工作区按索引还原 + 删掉索引里没有的新文件。
           # 只动同步产物的目录（与下面 Gate - changed paths 的白名单一致），.cache 在 .gitignore 里，git clean 不碰。
-          DATA_PATHS=(data/forever data/classic data/dungeons data/quests public/icons public/assets/dungeons src/data/forever src/data/classic)
+          DATA_PATHS=(data/forever data/classic data/titan data/dungeons data/quests public/icons public/assets/dungeons src/data/forever src/data/classic)
           checkpoint() { git add -A -- "${DATA_PATHS[@]}"; }
           rollback() { git checkout -q -- "${DATA_PATHS[@]}"; git clean -fdq -- "${DATA_PATHS[@]}"; }
           STEP_INVALID=false   # 上一项是不是因为数据校验没过而失败（给 invalid_mark 判断）
@@ -457,6 +460,21 @@ jobs:
             # shellcheck disable=SC2086
             step --check dungeonArt "首领坐标" "同步失败（wago.tools 不可用），本次跳过，沿用现有坐标。" \
               node scripts/sync-boss-positions.js $FORCE --report "$REPORT"
+
+            # ---- 时光服 ----
+            # 物价行情每日快照（蓝色隐士 trt 只读接口，不依赖 Wowhead 的 token / 暂停开关）。脚本自己整批校验、两份 JSON 同时落盘，
+            # 失败不留残数据，所以这里只管调度：每天（UTC）第一轮跑，成功且有改动要等合并后才记为跑过（done_mark）。
+            # 私有仓库里还没有这个脚本时（站点 PR 没合）直接跳过，不算失败。
+            if [ ! -f scripts/sync-titan-item-price.mjs ]; then
+              skipped "时光服物价行情" "私有仓库还没有 scripts/sync-titan-item-price.mjs，本次跳过。"
+            elif due titan-item-price; then
+              BEFORE="$(snap)"
+              step "时光服物价行情" "同步失败（蓝色隐士接口被拦、返回异常或数据没通过校验），本次跳过，沿用昨天的快照。" \
+                timeout 40m node scripts/sync-titan-item-price.mjs \
+                && done_mark titan-item-price "$BEFORE" || invalid_mark titan-item-price
+            else
+              skipped "时光服物价行情" "今天已同步过，本次跳过。"
+            fi
           fi
           if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -498,7 +516,7 @@ jobs:
           bash -euo pipefail > "$PRIV/gate.log" 2>&1 <<'GATE' || { echo "::error::改动超出数据目录，不开 PR（原因见加密 artifact 里的 gate.log）"; exit 1; }
           BAD=$(git -c core.quotepath=off status --porcelain --untracked-files=all \
             | cut -c4- \
-            | grep -vE '^(data/(forever|classic|dungeons|quests)/|public/icons/|public/assets/dungeons/|src/data/(forever|classic)/)' || true)
+            | grep -vE '^(data/(forever|classic|titan|dungeons|quests)/|public/icons/|public/assets/dungeons/|src/data/(forever|classic)/)' || true)
           if [ -n "$BAD" ]; then
             echo "同步改动了数据目录以外的文件："
             echo "$BAD"
