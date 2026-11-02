@@ -838,7 +838,16 @@ jobs:
             export SYNC_CHECKS_FILE="${RUNNER_TEMP}/sync-checks.json"
           fi
           # 只升补丁号；版本提交、CHANGELOG、release-v* tag 由 standard-version 生成（配置见私有仓库 package.json）。
-          pnpm exec standard-version --release-as patch
+          # 起点取 package.json 与已有 release-v* tag 里较大的那个：绕过 standard-version 直接推 tag 发版时 package.json
+          # 不会跟着升，照旧 --release-as patch 会算出已存在的 tag（#168 就是 0.2.68 撞上手工打的 release-v0.2.69）。
+          NEXT="$(git tag -l 'release-v*' | node -e '
+            const vs = [require("./package.json").version, ...require("fs").readFileSync(0, "utf8").split("\n").map((t) => t.slice("release-v".length))]
+              .filter((v) => /^\d+\.\d+\.\d+$/.test(v))
+              .map((v) => v.split(".").map(Number));
+            const [x, y, z] = vs.reduce((a, b) => ((a[0] - b[0] || a[1] - b[1] || a[2] - b[2]) >= 0 ? a : b));
+            console.log(`${x}.${y}.${z + 1}`);
+          ')"
+          pnpm exec standard-version --release-as "$NEXT"
           TAG="release-v$(node -p 'require("./package.json").version')"
           # PAT 推的 tag 会触发私有仓库 deploy.yml 的 push tags（GITHUB_TOKEN 推的不会）。
           # tag 显式推，且与 main 原子推送：--follow-tags 碰到远端已有同名 tag 会静默跳过，main 升了版本却不部署。
