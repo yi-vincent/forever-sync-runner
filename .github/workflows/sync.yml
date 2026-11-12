@@ -27,6 +27,7 @@ name: Sync data
 #
 # 不是每一项每次都全量拉（手动运行勾选「全量」时例外，一律照跑）：
 #   · 任务、首领坐标：脚本先算上游指纹，与产物 meta.input 相同就跳过。
+#     Forever 新增任务（scripts/sync-forever-quest-delta.js）例外：骨架同样看指纹，但中文每天（UTC 日期）复查一次。
 #   · Forever 的装备 / 物品 / 天赋 / 传承（Wowhead 数据页）：先看数据页上的客户端 build（scripts/check-wowhead-build.js），
 #     变了立刻跑；没变时每天（UTC 日期）至少全量跑一次 —— Wowhead 改数据不一定升 build，不能只看它。
 #     四项全部成功才记为今天跑过，有一项失败下一轮四项照跑。
@@ -404,6 +405,19 @@ jobs:
             # shellcheck disable=SC2086
             step --check quests "任务数据" "同步失败（cMaNGOS 或 wago 下载失败），本次跳过，沿用现有数据。" \
               node scripts/sync-quest-data.js $FORCE --report "$REPORT"
+            # Forever 新增任务（Questie 编译库补的 90000 段任务，名字与目标文字从 Wowhead 任务 tooltip 补中文，见脚本头）。
+            # 骨架按上游指纹自己判断要不要重算；中文每天复查一次（官方译文陆续上线，没汉化的每轮几百个小请求）。
+            # 没有这一项时 data/quests/quests-forever.json 永远停在第一次同步的样子：871 个任务全是英文。
+            # 被拦 / 校验不过只跳过这一项，沿用现有数据。
+            if due quests-forever; then
+              BEFORE="$(snap)"
+              # shellcheck disable=SC2086
+              step --check foreverQuests "Forever 任务" "同步失败（Questie 发布包、wago 或 Wowhead 任务 tooltip 下载失败），本次跳过，沿用现有数据。" \
+                node scripts/sync-forever-quest-delta.js $FORCE --report "$REPORT" \
+                && done_mark quests-forever "$BEFORE" || invalid_mark quests-forever
+            else
+              skipped "Forever 任务" "今天已同步过，本次跳过。"
+            fi
             # 阵营声望与坐骑（只有 Forever）：声望每天抓 60 个阵营页，坐骑平时只抓 1 个列表页（物品页增量，见下）。
             # 和副本掉落一样每天最多跑一次，被拦只跳过本项。脚本最终失败直接报错、不写半截数据。
             if paused "阵营声望（Forever）"; then :
