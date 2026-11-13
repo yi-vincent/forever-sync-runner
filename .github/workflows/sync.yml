@@ -31,7 +31,8 @@ name: Sync data
 #   · Forever 的装备 / 物品 / 天赋 / 传承（Wowhead 数据页）：先看数据页上的客户端 build（scripts/check-wowhead-build.js），
 #     变了立刻跑；没变时每天（UTC 日期）至少全量跑一次 —— Wowhead 改数据不一定升 build，不能只看它。
 #     四项全部成功才记为今天跑过，有一项失败下一轮四项照跑。
-#   · Forever 的副本掉落（几百个页面，耗时大头）：每天跑一次。
+#   · Forever 的副本掉落（几百个页面，耗时大头）：每天跑一次；Forever / 经典页面都按周缓存累积进度，
+#     超时（70m）当天不再重试，避免同日每两小时再烧满限时。
 #   · 时光服物价行情（scripts/sync-titan-item-price.mjs，约 800 个请求、几分钟）：每天一次，当天第一轮跑。脚本整批校验通过才写盘
 #     （index.json 与 detail.json 一起落盘），被拦 / 校验不过 / 物品数缩水超过 30% 时退出 1 且不动旧文件，本项按软失败处理、沿用昨天的快照。
 #   · 经典 60 已经稳定，只按版本号同步：Wowhead 经典数据版本与 wago 经典客户端 build（wow_classic_era）
@@ -142,17 +143,17 @@ jobs:
         with:
           node-version: 22
 
-      # 副本掉落里经典旧世的页面（三百多个地区页 / 首领页）早已定型，按周缓存，进度逐轮累积：
-      # 每轮另存一份新 key（带 run_id），restore-keys 取本周最近的那份，所以上一轮没拉完的页面这一轮只补缺的。
-      # （以前一周只存一次、同 key 存了就改不了：第一次被拦只拉到几十页的残缺缓存，之后整周每轮都要重拉剩下的，
-      #   副本掉落跑到 45 分钟限时被杀，进度也存不下来。）换周前缀不同，从空目录开始。只跑热修时不碰这份缓存。
+      # 副本掉落页面缓存（按周、带 run_id 逐轮累积；换周前缀不同，从空目录开始）。只跑热修时不碰。
       # 公开仓库的 Actions cache 只有本仓库的 workflow 读得到，外人下载不了。
-      # 经典 60 的副本掉落用的就是这批经典旧世页面（同名同址），一并读写这份缓存。
+      #   · 经典旧世页（.cache/zone-loot-classic）：早已定型；Forever 与经典 60 共用这份。
+      #   · Forever 实体页（.cache/zone-loot-forever）：以前每轮实时拉，被 WAF 限流卡满 70 分钟后进度全丢；
+      #     11-13 起也按周缓存，超时被杀时已拉到的完整页留下，下一轮（或次日）只补缺的。
       - name: Week and day keys
         id: week
         if: env.HOTFIX_ONLY != 'true'
         run: |
           echo "key=zone-loot-classic-$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+          echo "forever_key=zone-loot-forever-$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
           echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
 
       - name: Restore classic page cache
@@ -170,6 +171,21 @@ jobs:
         if: env.HOTFIX_ONLY != 'true'
         env:
           RESTORED: ${{ hashFiles('.cache/zone-loot-classic/**') }}
+        run: echo "hash=${RESTORED}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore forever page cache
+        if: env.HOTFIX_ONLY != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/zone-loot-forever
+          key: ${{ steps.week.outputs.forever_key }}-${{ github.run_id }}
+          restore-keys: ${{ steps.week.outputs.forever_key }}
+
+      - name: Fingerprint restored forever pages
+        id: forever_before
+        if: env.HOTFIX_ONLY != 'true'
+        env:
+          RESTORED: ${{ hashFiles('.cache/zone-loot-forever/**') }}
         run: echo "hash=${RESTORED}" >> "$GITHUB_OUTPUT"
 
       # 「今天已跑过」的标记：每次运行都另存一份新 key（带 run_id），restore-keys 取当天最近的那份。
@@ -378,14 +394,24 @@ jobs:
               skipped "专业数据" "客户端 build 没变、这 12 小时已同步过，本次跳过。"
             fi
             # 被拦（403 / 405）一次退避最长要等七分多钟，被拦后还会放慢节奏，单独限时 70 分钟（脚本最后才写盘，超时不会留半截数据；
-            # 拉到的经典页面照样存进缓存，下一轮接着补）。11-05 run #177 在 45 分钟处被杀。整个 job 上限 150 分钟，
-            # 这一项 70 + 经典 60 的副本掉落 20 + 时光服物价 40 加起来也不会撑破。每天跑一次（失败不记，下次再试）。
+            # 拉到的经典 / Forever 页面照样存进按周缓存，下一轮接着补）。11-05 run #177 在 45 分钟处被杀。
+            # 整个 job 上限 150 分钟，这一项 70 + 经典 60 的副本掉落 20 + 时光服物价 40 加起来也不会撑破。
+            # 成功或数据校验没过：done_mark / invalid_mark 照旧。超时（exit 124）：当天记空标记，避免同日每两小时再烧 70 分钟；
+            # 其它网络失败仍不记，下一轮照常重试。页面进度靠上面的 forever/classic 缓存跨轮累积。
             if paused "副本掉落"; then :
             elif due zone-loot-forever; then
               BEFORE="$(snap)"
               step --check zones "副本掉落" "同步失败或超时（地区 / NPC 页可能被 CloudFront 拦截），本次跳过，沿用现有数据。" \
-                timeout 70m node scripts/sync-zone-loot.js --assets --classic-cache .cache/zone-loot-classic --report "$REPORT" \
-                && done_mark zone-loot-forever "$BEFORE" || invalid_mark zone-loot-forever
+                timeout 70m node scripts/sync-zone-loot.js --assets --cache .cache/zone-loot-forever --classic-cache .cache/zone-loot-classic --report "$REPORT"
+              zl_rc=$?
+              if [ "$zl_rc" -eq 0 ]; then
+                done_mark zone-loot-forever "$BEFORE"
+              elif [ "$STEP_INVALID" = true ]; then
+                invalid_mark zone-loot-forever
+              elif [ "$zl_rc" -eq 124 ]; then
+                : > "$MARKS/zone-loot-forever"
+                echo "副本掉落超时，今日内不再重试（页面缓存已保留进度，明天再试）"
+              fi
             else
               skipped "副本掉落" "今天已同步过，本次跳过。"
             fi
@@ -524,7 +550,7 @@ jobs:
           fi
           exit 0
 
-      # 这一轮拉到的经典旧世页面存起来（脚本中途失败 / 超时被杀也存：已拉到的页面都是完整的，缺的下次补拉）。
+      # 这一轮拉到的页面存起来（脚本中途失败 / 超时被杀也存：已拉到的页面都是完整的，缺的下次补拉）。
       # 只在页面比恢复出来的多了才存；key 带 run_id，每轮一份，下一轮从本周最近的一份接着补。
       - name: Save classic page cache
         if: >-
@@ -535,6 +561,16 @@ jobs:
         with:
           path: .cache/zone-loot-classic
           key: ${{ steps.week.outputs.key }}-${{ github.run_id }}
+
+      - name: Save forever page cache
+        if: >-
+          always() && env.HOTFIX_ONLY != 'true' &&
+          hashFiles('.cache/zone-loot-forever/**') != '' &&
+          hashFiles('.cache/zone-loot-forever/**') != steps.forever_before.outputs.hash
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/zone-loot-forever
+          key: ${{ steps.week.outputs.forever_key }}-${{ github.run_id }}
 
       - name: Gate - changed paths
         id: gate
